@@ -120,7 +120,7 @@ export interface GetFilesOptions {
   /**
    * @deprecated dirrectory is deprecated
    * @internal
-   * */
+  */
   directory?: string;
   endOffset?: string;
   includeTrailingDelimiter?: boolean;
@@ -1362,7 +1362,7 @@ class Bucket extends ServiceObject {
    * metadata's `kms_key_name` value, if any.
    * @param {string} [options.userProject] The ID of the project which will be
    *     billed for the request.
-
+   *
    * @param {CombineCallback} [callback] Callback function.
    * @returns {Promise<CombineResponse>}
    *
@@ -4090,7 +4090,7 @@ class Bucket extends ServiceObject {
    * @param {boolean} [options.public] Make files public.
    * @param {string} [options.userProject] The ID of the project which will be
    *     billed for the request.
-
+   *
    * @param {MakeAllFilesPublicPrivateCallback} callback Callback function.
    *
    * @return {Promise<MakeAllFilesPublicPrivateResponse>}
