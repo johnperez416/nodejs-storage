@@ -12,17 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {Metadata, ServiceObject, Methods} from '@google-cloud/common';
-import {Storage} from './storage';
+import {
+  ServiceObject,
+  Methods,
+  MetadataCallback,
+  SetMetadataResponse,
+} from './nodejs-common/index.js';
+import {
+  BaseMetadata,
+  SetMetadataOptions,
+} from './nodejs-common/service-object.js';
+import {IdempotencyStrategy, Storage} from './storage.js';
+import {promisifyAll} from '@google-cloud/promisify';
 
 export interface HmacKeyOptions {
   projectId?: string;
 }
 
-export interface HmacKeyMetadata {
-  accessId: string;
+export interface HmacKeyMetadata extends BaseMetadata {
+  accessId?: string;
   etag?: string;
-  id?: string;
   projectId?: string;
   serviceAccountEmail?: string;
   state?: string;
@@ -43,10 +52,10 @@ export interface SetHmacKeyMetadata {
 }
 
 export interface HmacKeyMetadataCallback {
-  (err: Error | null, metadata?: HmacKeyMetadata, apiResponse?: Metadata): void;
+  (err: Error | null, metadata?: HmacKeyMetadata, apiResponse?: unknown): void;
 }
 
-export type HmacKeyMetadataResponse = [HmacKeyMetadata, Metadata];
+export type HmacKeyMetadataResponse = [HmacKeyMetadata, unknown];
 
 /**
  * The API-formatted resource description of the HMAC key.
@@ -66,8 +75,15 @@ export type HmacKeyMetadataResponse = [HmacKeyMetadata, Metadata];
  *
  * @class
  */
-export class HmacKey extends ServiceObject<HmacKeyMetadata | undefined> {
-  metadata: HmacKeyMetadata | undefined;
+export class HmacKey extends ServiceObject<HmacKey, HmacKeyMetadata> {
+  /**
+   * A reference to the {@link Storage} associated with this {@link HmacKey}
+   * instance.
+   * @name HmacKey#storage
+   * @type {Storage}
+   */
+  storage: Storage;
+  private instanceRetryValue?: boolean;
 
   /**
    * @typedef {object} HmacKeyOptions
@@ -339,5 +355,65 @@ export class HmacKey extends ServiceObject<HmacKeyMetadata | undefined> {
       baseUrl: `/projects/${projectId}/hmacKeys`,
       methods,
     });
+
+    this.storage = storage;
+    this.instanceRetryValue = storage.retryOptions.autoRetry;
+  }
+
+  /**
+   * Set the metadata for this object.
+   *
+   * @param {object} metadata - The metadata to set on this object.
+   * @param {object=} options - Configuration options.
+   * @param {function=} callback - The callback function.
+   * @param {?error} callback.err - An error returned while making this request.
+   * @param {object} callback.apiResponse - The full API response.
+   */
+  setMetadata(
+    metadata: HmacKeyMetadata,
+    options?: SetMetadataOptions
+  ): Promise<SetMetadataResponse<HmacKeyMetadata>>;
+  setMetadata(
+    metadata: HmacKeyMetadata,
+    callback: MetadataCallback<HmacKeyMetadata>
+  ): void;
+  setMetadata(
+    metadata: HmacKeyMetadata,
+    options: SetMetadataOptions,
+    callback: MetadataCallback<HmacKeyMetadata>
+  ): void;
+  setMetadata(
+    metadata: HmacKeyMetadata,
+    optionsOrCallback: SetMetadataOptions | MetadataCallback<HmacKeyMetadata>,
+    cb?: MetadataCallback<HmacKeyMetadata>
+  ): Promise<SetMetadataResponse<HmacKeyMetadata>> | void {
+    // ETag preconditions are not currently supported. Retries should be disabled if the idempotency strategy is not set to RetryAlways
+    if (
+      this.storage.retryOptions.idempotencyStrategy !==
+      IdempotencyStrategy.RetryAlways
+    ) {
+      this.storage.retryOptions.autoRetry = false;
+    }
+    const options =
+      typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
+    cb =
+      typeof optionsOrCallback === 'function'
+        ? (optionsOrCallback as MetadataCallback<HmacKeyMetadata>)
+        : cb;
+
+    super
+      .setMetadata(metadata, options)
+      .then(resp => cb!(null, ...resp))
+      .catch(cb!)
+      .finally(() => {
+        this.storage.retryOptions.autoRetry = this.instanceRetryValue;
+      });
   }
 }
+
+/*! Developer Documentation
+ *
+ * All async methods (except for streams) will return a Promise in the event
+ * that a callback is omitted.
+ */
+promisifyAll(HmacKey);

@@ -12,40 +12,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {
-  ApiError,
-  Metadata,
-  Service,
-  ServiceOptions,
-} from '@google-cloud/common';
+import {ApiError, Service, ServiceOptions} from './nodejs-common/index.js';
 import {paginator} from '@google-cloud/paginator';
 import {promisifyAll} from '@google-cloud/promisify';
-import arrify = require('arrify');
 import {Readable} from 'stream';
 
-import {Bucket} from './bucket';
-import {Channel} from './channel';
-import {File} from './file';
-import {normalize} from './util';
-import {HmacKey, HmacKeyMetadata, HmacKeyOptions} from './hmacKey';
+import {Bucket, BucketMetadata} from './bucket.js';
+import {Channel} from './channel.js';
+import {File} from './file.js';
+import {normalize} from './util.js';
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+import {getPackageJSON} from './package-json-helper.cjs';
+import {HmacKey, HmacKeyMetadata, HmacKeyOptions} from './hmacKey.js';
+import {
+  CRC32CValidatorGenerator,
+  CRC32C_DEFAULT_VALIDATOR_GENERATOR,
+} from './crc32c.js';
+import {DEFAULT_UNIVERSE} from 'google-auth-library';
 
 export interface GetServiceAccountOptions {
   userProject?: string;
+  projectIdentifier?: string;
 }
 export interface ServiceAccount {
   emailAddress?: string;
 }
-export type GetServiceAccountResponse = [ServiceAccount, Metadata];
+export type GetServiceAccountResponse = [ServiceAccount, unknown];
 export interface GetServiceAccountCallback {
   (
     err: Error | null,
     serviceAccount?: ServiceAccount,
-    apiResponse?: Metadata
+    apiResponse?: unknown
   ): void;
 }
 
 export interface CreateBucketQuery {
+  enableObjectRetention: boolean;
+  predefinedAcl?:
+    | 'authenticatedRead'
+    | 'private'
+    | 'projectPrivate'
+    | 'publicRead'
+    | 'publicReadWrite';
+  predefinedDefaultObjectAcl?:
+    | 'authenticatedRead'
+    | 'bucketOwnerFullControl'
+    | 'bucketOwnerRead'
+    | 'private'
+    | 'projectPrivate'
+    | 'publicRead';
   project: string;
+  projection?: 'full' | 'noAcl';
   userProject: string;
 }
 
@@ -66,40 +84,29 @@ export interface RetryOptions {
 }
 
 export interface PreconditionOptions {
-  ifGenerationMatch?: number;
-  ifGenerationNotMatch?: number;
-  ifMetagenerationMatch?: number;
-  ifMetagenerationNotMatch?: number;
+  ifGenerationMatch?: number | string;
+  ifGenerationNotMatch?: number | string;
+  ifMetagenerationMatch?: number | string;
+  ifMetagenerationNotMatch?: number | string;
 }
 
 export interface StorageOptions extends ServiceOptions {
-  retryOptions?: RetryOptions;
-  /**
-   * @deprecated Use retryOptions instead.
-   * @internal
-   */
-  autoRetry?: boolean;
-  /**
-   * @deprecated Use retryOptions instead.
-   * @internal
-   */
-  maxRetries?: number;
-  /**
-   * **This option is deprecated.**
-   * @todo Remove in next major release.
-   */
-  promise?: typeof Promise;
   /**
    * The API endpoint of the service used to make requests.
    * Defaults to `storage.googleapis.com`.
    */
   apiEndpoint?: string;
+  crc32cGenerator?: CRC32CValidatorGenerator;
+  retryOptions?: RetryOptions;
 }
 
 export interface BucketOptions {
+  crc32cGenerator?: CRC32CValidatorGenerator;
   kmsKeyName?: string;
-  userProject?: string;
   preconditionOpts?: PreconditionOptions;
+  userProject?: string;
+  generation?: number;
+  softDeleted?: boolean;
 }
 
 export interface Cors {
@@ -113,36 +120,63 @@ interface Versioning {
   enabled: boolean;
 }
 
-export interface CreateBucketRequest {
+/**
+ * Custom placement configuration.
+ * Initially used for dual-region buckets.
+ **/
+export interface CustomPlacementConfig {
+  dataLocations?: string[];
+}
+
+export interface AutoclassConfig {
+  enabled?: boolean;
+  terminalStorageClass?: 'NEARLINE' | 'ARCHIVE';
+}
+
+export interface CreateBucketRequest extends BucketMetadata {
   archive?: boolean;
   coldline?: boolean;
-  cors?: Cors[];
+  dataLocations?: string[];
   dra?: boolean;
+  enableObjectRetention?: boolean;
   multiRegional?: boolean;
   nearline?: boolean;
+  predefinedAcl?:
+    | 'authenticatedRead'
+    | 'private'
+    | 'projectPrivate'
+    | 'publicRead'
+    | 'publicReadWrite';
+  predefinedDefaultObjectAcl?:
+    | 'authenticatedRead'
+    | 'bucketOwnerFullControl'
+    | 'bucketOwnerRead'
+    | 'private'
+    | 'projectPrivate'
+    | 'publicRead';
+  projection?: 'full' | 'noAcl';
   regional?: boolean;
   requesterPays?: boolean;
-  retentionPolicy?: object;
+  rpo?: string;
   standard?: boolean;
   storageClass?: string;
   userProject?: string;
-  location?: string;
   versioning?: Versioning;
 }
 
-export type CreateBucketResponse = [Bucket, Metadata];
+export type CreateBucketResponse = [Bucket, unknown];
 
 export interface BucketCallback {
-  (err: Error | null, bucket?: Bucket | null, apiResponse?: Metadata): void;
+  (err: Error | null, bucket?: Bucket | null, apiResponse?: unknown): void;
 }
 
-export type GetBucketsResponse = [Bucket[], {}, Metadata];
+export type GetBucketsResponse = [Bucket[], {}, unknown];
 export interface GetBucketsCallback {
   (
     err: Error | null,
     buckets: Bucket[],
     nextQuery?: {},
-    apiResponse?: Metadata
+    apiResponse?: unknown
   ): void;
 }
 export interface GetBucketsRequest {
@@ -153,6 +187,8 @@ export interface GetBucketsRequest {
   maxResults?: number;
   pageToken?: string;
   userProject?: string;
+  softDeleted?: boolean;
+  generation?: number;
 }
 
 export interface HmacKeyResourceResponse {
@@ -192,8 +228,20 @@ export interface GetHmacKeysCallback {
     err: Error | null,
     hmacKeys: HmacKey[] | null,
     nextQuery?: {},
-    apiResponse?: Metadata
+    apiResponse?: unknown
   ): void;
+}
+
+export enum ExceptionMessages {
+  EXPIRATION_DATE_INVALID = 'The expiration date provided was invalid.',
+  EXPIRATION_DATE_PAST = 'An expiration date cannot be in the past.',
+}
+
+export enum StorageExceptionMessages {
+  BUCKET_NAME_REQUIRED = 'A bucket name is needed to use Cloud Storage.',
+  BUCKET_NAME_REQUIRED_CREATE = 'A name is required to create a bucket.',
+  HMAC_SERVICE_ACCOUNT = 'The first argument must be a service account email to create an HMAC key.',
+  HMAC_ACCESS_ID = 'An access ID is needed to create an HmacKey object.',
 }
 
 export type GetHmacKeysResponse = [HmacKey[]];
@@ -204,42 +252,37 @@ export const PROTOCOL_REGEX = /^(\w*):\/\//;
  * Default behavior: Automatically retry retriable server errors.
  *
  * @const {boolean}
- * @private
  */
-const AUTO_RETRY_DEFAULT = true;
+export const AUTO_RETRY_DEFAULT = true;
 
 /**
  * Default behavior: Only attempt to retry retriable errors 3 times.
  *
  * @const {number}
- * @private
  */
-const MAX_RETRY_DEFAULT = 3;
+export const MAX_RETRY_DEFAULT = 3;
 
 /**
  * Default behavior: Wait twice as long as previous retry before retrying.
  *
  * @const {number}
- * @private
  */
-const RETRY_DELAY_MULTIPLIER_DEFAULT = 2;
+export const RETRY_DELAY_MULTIPLIER_DEFAULT = 2;
 
 /**
  * Default behavior: If the operation doesn't succeed after 600 seconds,
  *  stop retrying.
  *
  * @const {number}
- * @private
  */
-const TOTAL_TIMEOUT_DEFAULT = 600;
+export const TOTAL_TIMEOUT_DEFAULT = 600;
 
 /**
  * Default behavior: Wait no more than 64 seconds between retries.
  *
  * @const {number}
- * @private
  */
-const MAX_RETRY_DELAY_DEFAULT = 64;
+export const MAX_RETRY_DELAY_DEFAULT = 64;
 
 /**
  * Default behavior: Retry conditionally idempotent operations if correct preconditions are set.
@@ -253,24 +296,39 @@ const IDEMPOTENCY_STRATEGY_DEFAULT = IdempotencyStrategy.RetryConditional;
  * Returns true if the API request should be retried, given the error that was
  * given the first time the request was attempted.
  * @const
- * @private
  * @param {error} err - The API error to check if it is appropriate to retry.
  * @return {boolean} True if the API request should be retried, false otherwise.
  */
-const RETRYABLE_ERR_FN_DEFAULT = function (err?: ApiError) {
+export const RETRYABLE_ERR_FN_DEFAULT = function (err?: ApiError) {
+  const isConnectionProblem = (reason: string) => {
+    return (
+      reason.includes('eai_again') || // DNS lookup error
+      reason === 'econnreset' ||
+      reason === 'unexpected connection closure' ||
+      reason === 'epipe' ||
+      reason === 'socket connection timeout'
+    );
+  };
+
   if (err) {
     if ([408, 429, 500, 502, 503, 504].indexOf(err.code!) !== -1) {
       return true;
     }
 
+    if (typeof err.code === 'string') {
+      if (['408', '429', '500', '502', '503', '504'].indexOf(err.code) !== -1) {
+        return true;
+      }
+      const reason = (err.code as string).toLowerCase();
+      if (isConnectionProblem(reason)) {
+        return true;
+      }
+    }
+
     if (err.errors) {
       for (const e of err.errors) {
         const reason = e?.reason?.toString().toLowerCase();
-        if (
-          (reason && reason.includes('eai_again')) || //DNS lookup error
-          reason === 'econnreset' ||
-          reason === 'unexpected connection closure'
-        ) {
+        if (reason && isConnectionProblem(reason)) {
           return true;
         }
       }
@@ -469,11 +527,82 @@ export class Storage extends Service {
    */
   acl: typeof Storage.acl;
 
-  getBucketsStream: () => Readable;
-  getHmacKeysStream: () => Readable;
+  crc32cGenerator: CRC32CValidatorGenerator;
+
+  getBucketsStream(): Readable {
+    // placeholder body, overwritten in constructor
+    return new Readable();
+  }
+
+  getHmacKeysStream(): Readable {
+    // placeholder body, overwritten in constructor
+    return new Readable();
+  }
 
   retryOptions: RetryOptions;
 
+  /**
+   * @callback Crc32cGeneratorToStringCallback
+   * A method returning the CRC32C as a base64-encoded string.
+   *
+   * @returns {string}
+   *
+   * @example
+   * Hashing the string 'data' should return 'rth90Q=='
+   *
+   * ```js
+   * const buffer = Buffer.from('data');
+   * crc32c.update(buffer);
+   * crc32c.toString(); // 'rth90Q=='
+   * ```
+   **/
+  /**
+   * @callback Crc32cGeneratorValidateCallback
+   * A method validating a base64-encoded CRC32C string.
+   *
+   * @param {string} [value] base64-encoded CRC32C string to validate
+   * @returns {boolean}
+   *
+   * @example
+   * Should return `true` if the value matches, `false` otherwise
+   *
+   * ```js
+   * const buffer = Buffer.from('data');
+   * crc32c.update(buffer);
+   * crc32c.validate('DkjKuA=='); // false
+   * crc32c.validate('rth90Q=='); // true
+   * ```
+   **/
+  /**
+   * @callback Crc32cGeneratorUpdateCallback
+   * A method for passing `Buffer`s for CRC32C generation.
+   *
+   * @param {Buffer} [data] data to update CRC32C value with
+   * @returns {undefined}
+   *
+   * @example
+   * Hashing buffers from 'some ' and 'text\n'
+   *
+   * ```js
+   * const buffer1 = Buffer.from('some ');
+   * crc32c.update(buffer1);
+   *
+   * const buffer2 = Buffer.from('text\n');
+   * crc32c.update(buffer2);
+   *
+   * crc32c.toString(); // 'DkjKuA=='
+   * ```
+   **/
+  /**
+   * @typedef {object} CRC32CValidator
+   * @property {Crc32cGeneratorToStringCallback}
+   * @property {Crc32cGeneratorValidateCallback}
+   * @property {Crc32cGeneratorUpdateCallback}
+   */
+  /**
+   * @callback Crc32cGeneratorCallback
+   * @returns {CRC32CValidator}
+   */
   /**
    * @typedef {object} StorageOptions
    * @property {string} [projectId] The project ID from the Google Developer's
@@ -519,11 +648,12 @@ export class Storage extends Service {
    *     retry a conditionally idempotent operation.
    * @property {string} [userAgent] The value to be prepended to the User-Agent
    *     header in API requests.
-   * @property {object} [authClient] GoogleAuth client to reuse instead of creating a new one.
+   * @property {object} [authClient] `AuthClient` or `GoogleAuth` client to reuse instead of creating a new one.
    * @property {number} [timeout] The amount of time in milliseconds to wait per http request before timing out.
    * @property {object[]} [interceptors_] Array of custom request interceptors to be returned in the order they were assigned.
    * @property {string} [apiEndpoint = storage.google.com] The API endpoint of the service used to make requests.
-   * @property {boolean} [useAuthWithCustomEndpoint] Controls whether or not to use authentication when using a custom endpoint.
+   * @property {boolean} [useAuthWithCustomEndpoint = false] Controls whether or not to use authentication when using a custom endpoint.
+   * @property {Crc32cGeneratorCallback} [callback] A function that generates a CRC32C Validator. Defaults to {@link CRC32C}
    */
   /**
    * Constructs the Storage client.
@@ -544,11 +674,57 @@ export class Storage extends Service {
    *   keyFilename: '/path/to/keyfile.json'
    * });
    * ```
-
+   *
+   * @example
+   * Create a client with credentials passed
+   * by value as a JavaScript object
+   * ```
+   * const storage = new Storage({
+   *   projectId: 'your-project-id',
+   *   credentials: {
+   *     type: 'service_account',
+   *     project_id: 'xxxxxxx',
+   *     private_key_id: 'xxxx',
+   *     private_key:'-----BEGIN PRIVATE KEY-----xxxxxxx\n-----END PRIVATE KEY-----\n',
+   *     client_email: 'xxxx',
+   *     client_id: 'xxx',
+   *     auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+   *     token_uri: 'https://oauth2.googleapis.com/token',
+   *     auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+   *     client_x509_cert_url: 'xxx',
+   *     }
+   * });
+   * ```
+   *
+   * @example
+   * Create a client with credentials passed
+   * by loading a JSON file directly from disk
+   * ```
+   * const storage = new Storage({
+   *   projectId: 'your-project-id',
+   *   credentials: require('/path/to-keyfile.json')
+   * });
+   * ```
+   *
+   * @example
+   * Create a client with an `AuthClient` (e.g. `DownscopedClient`)
+   * ```
+   * const {DownscopedClient} = require('google-auth-library');
+   * const authClient = new DownscopedClient({...});
+   *
+   * const storage = new Storage({authClient});
+   * ```
+   *
+   * Additional samples:
+   * - https://github.com/googleapis/google-auth-library-nodejs#sample-usage-1
+   * - https://github.com/googleapis/google-auth-library-nodejs/blob/main/samples/downscopedclient.js
+   *
    * @param {StorageOptions} [options] Configuration options.
    */
   constructor(options: StorageOptions = {}) {
-    let apiEndpoint = 'https://storage.googleapis.com';
+    const universe = options.universeDomain || DEFAULT_UNIVERSE;
+
+    let apiEndpoint = `https://storage.${universe}`;
     let customEndpoint = false;
 
     // Note: EMULATOR_HOST is an experimental configuration variable. Use apiEndpoint instead.
@@ -558,7 +734,7 @@ export class Storage extends Service {
       customEndpoint = true;
     }
 
-    if (options.apiEndpoint) {
+    if (options.apiEndpoint && options.apiEndpoint !== apiEndpoint) {
       apiEndpoint = Storage.sanitizeEndpoint(options.apiEndpoint);
       customEndpoint = true;
     }
@@ -568,36 +744,16 @@ export class Storage extends Service {
     // Note: EMULATOR_HOST is an experimental configuration variable. Use apiEndpoint instead.
     const baseUrl = EMULATOR_HOST || `${options.apiEndpoint}/storage/v1`;
 
-    let autoRetryValue = AUTO_RETRY_DEFAULT;
-    if (
-      options.autoRetry !== undefined &&
-      options.retryOptions?.autoRetry !== undefined
-    ) {
-      throw new ApiError(
-        'autoRetry is deprecated. Use retryOptions.autoRetry instead.'
-      );
-    } else if (options.autoRetry !== undefined) {
-      autoRetryValue = options.autoRetry;
-    } else if (options.retryOptions?.autoRetry !== undefined) {
-      autoRetryValue = options.retryOptions.autoRetry;
-    }
-
-    let maxRetryValue = MAX_RETRY_DEFAULT;
-    if (options.maxRetries && options.retryOptions?.maxRetries) {
-      throw new ApiError(
-        'maxRetries is deprecated. Use retryOptions.maxRetries instead.'
-      );
-    } else if (options.maxRetries) {
-      maxRetryValue = options.maxRetries;
-    } else if (options.retryOptions?.maxRetries) {
-      maxRetryValue = options.retryOptions.maxRetries;
-    }
-
     const config = {
       apiEndpoint: options.apiEndpoint!,
       retryOptions: {
-        autoRetry: autoRetryValue,
-        maxRetries: maxRetryValue,
+        autoRetry:
+          options.retryOptions?.autoRetry !== undefined
+            ? options.retryOptions?.autoRetry
+            : AUTO_RETRY_DEFAULT,
+        maxRetries: options.retryOptions?.maxRetries
+          ? options.retryOptions?.maxRetries
+          : MAX_RETRY_DEFAULT,
         retryDelayMultiplier: options.retryOptions?.retryDelayMultiplier
           ? options.retryOptions?.retryDelayMultiplier
           : RETRY_DELAY_MULTIPLIER_DEFAULT,
@@ -624,7 +780,7 @@ export class Storage extends Service {
         'https://www.googleapis.com/auth/cloud-platform',
         'https://www.googleapis.com/auth/devstorage.full_control',
       ],
-      packageJson: require('../../package.json'),
+      packageJson: getPackageJSON(),
     };
 
     super(config, options);
@@ -636,6 +792,8 @@ export class Storage extends Service {
      * @see Storage.acl
      */
     this.acl = Storage.acl;
+    this.crc32cGenerator =
+      options.crc32cGenerator || CRC32C_DEFAULT_VALIDATOR_GENERATOR;
 
     this.retryOptions = config.retryOptions;
 
@@ -673,7 +831,7 @@ export class Storage extends Service {
    */
   bucket(name: string, options?: BucketOptions) {
     if (!name) {
-      throw new Error('A bucket name is needed to use Cloud Storage.');
+      throw new Error(StorageExceptionMessages.BUCKET_NAME_REQUIRED);
     }
     return new Bucket(this, name, options);
   }
@@ -728,17 +886,29 @@ export class Storage extends Service {
    *
    * @typedef {object} CreateBucketRequest
    * @property {boolean} [archive=false] Specify the storage class as Archive.
+   * @property {object} [autoclass.enabled=false] Specify whether Autoclass is
+   *     enabled for the bucket.
+   * @property {object} [autoclass.terminalStorageClass='NEARLINE'] The storage class that objects in an Autoclass bucket eventually transition to if
+   *     they are not read for a certain length of time. Valid values are NEARLINE and ARCHIVE.
    * @property {boolean} [coldline=false] Specify the storage class as Coldline.
    * @property {Cors[]} [cors=[]] Specify the CORS configuration to use.
+   * @property {CustomPlacementConfig} [customPlacementConfig={}] Specify the bucket's regions for dual-region buckets.
+   *     For more information, see {@link https://cloud.google.com/storage/docs/locations| Bucket Locations}.
    * @property {boolean} [dra=false] Specify the storage class as Durable Reduced
    *     Availability.
+   * @property {boolean} [enableObjectRetention=false] Specifiy whether or not object retention should be enabled on this bucket.
+   * @property {object} [hierarchicalNamespace.enabled=false] Specify whether or not to enable hierarchical namespace on this bucket.
+   * @property {string} [location] Specify the bucket's location. If specifying
+   *     a dual-region, the `customPlacementConfig` property should be set in conjunction.
+   *     For more information, see {@link https://cloud.google.com/storage/docs/locations| Bucket Locations}.
    * @property {boolean} [multiRegional=false] Specify the storage class as
    *     Multi-Regional.
    * @property {boolean} [nearline=false] Specify the storage class as Nearline.
    * @property {boolean} [regional=false] Specify the storage class as Regional.
-   * @property {boolean} [requesterPays=false] **Early Access Testers Only**
-   *     Force the use of the User Project metadata field to assign operational
+   * @property {boolean} [requesterPays=false] Force the use of the User Project metadata field to assign operational
    *     costs when an operation is made on a Bucket and its objects.
+   * @property {string} [rpo] For dual-region buckets, controls whether turbo
+   *      replication is enabled (`ASYNC_TURBO`) or disabled (`DEFAULT`).
    * @property {boolean} [standard=true] Specify the storage class as Standard.
    * @property {string} [storageClass] The new storage class. (`standard`,
    *     `nearline`, `coldline`, or `archive`).
@@ -831,7 +1001,7 @@ export class Storage extends Service {
     callback?: BucketCallback
   ): Promise<CreateBucketResponse> | void {
     if (!name) {
-      throw new Error('A name is required to create a bucket.');
+      throw new Error(StorageExceptionMessages.BUCKET_NAME_REQUIRED_CREATE);
     }
 
     let metadata: CreateBucketRequest;
@@ -842,8 +1012,9 @@ export class Storage extends Service {
       metadata = metadataOrCallback as CreateBucketRequest;
     }
 
-    const body = Object.assign({}, metadata, {name}) as {} as {
-      [index: string]: string | {};
+    const body: CreateBucketRequest & {[index: string]: string | {} | null} = {
+      ...metadata,
+      name,
     };
 
     const storageClasses = {
@@ -854,9 +1025,12 @@ export class Storage extends Service {
       nearline: 'NEARLINE',
       regional: 'REGIONAL',
       standard: 'STANDARD',
-    } as {[index: string]: string};
+    } as const;
+    const storageClassKeys = Object.keys(
+      storageClasses
+    ) as (keyof typeof storageClasses)[];
 
-    Object.keys(storageClasses).forEach(storageClass => {
+    for (const storageClass of storageClassKeys) {
       if (body[storageClass]) {
         if (metadata.storageClass && metadata.storageClass !== storageClass) {
           throw new Error(
@@ -866,7 +1040,7 @@ export class Storage extends Service {
         body.storageClass = storageClasses[storageClass];
         delete body[storageClass];
       }
-    });
+    }
 
     if (body.requesterPays) {
       body.billing = {
@@ -882,6 +1056,26 @@ export class Storage extends Service {
     if (body.userProject) {
       query.userProject = body.userProject as string;
       delete body.userProject;
+    }
+
+    if (body.enableObjectRetention) {
+      query.enableObjectRetention = body.enableObjectRetention;
+      delete body.enableObjectRetention;
+    }
+
+    if (body.predefinedAcl) {
+      query.predefinedAcl = body.predefinedAcl;
+      delete body.predefinedAcl;
+    }
+
+    if (body.predefinedDefaultObjectAcl) {
+      query.predefinedDefaultObjectAcl = body.predefinedDefaultObjectAcl;
+      delete body.predefinedDefaultObjectAcl;
+    }
+
+    if (body.projection) {
+      query.projection = body.projection;
+      delete body.projection;
     }
 
     this.request(
@@ -997,9 +1191,7 @@ export class Storage extends Service {
     cb?: CreateHmacKeyCallback
   ): Promise<CreateHmacKeyResponse> | void {
     if (typeof serviceAccountEmail !== 'string') {
-      throw new Error(
-        'The first argument must be a service account email to create an HMAC key.'
-      );
+      throw new Error(StorageExceptionMessages.HMAC_SERVICE_ACCOUNT);
     }
 
     const {options, callback} = normalize<
@@ -1024,7 +1216,7 @@ export class Storage extends Service {
         }
 
         const metadata = resp.metadata;
-        const hmacKey = this.hmacKey(metadata.accessId, {
+        const hmacKey = this.hmacKey(metadata.accessId!, {
           projectId: metadata.projectId,
         });
         hmacKey.metadata = resp.metadata;
@@ -1054,11 +1246,13 @@ export class Storage extends Service {
    *     representing part of the larger set of results to view.
    * @property {string} [userProject] The ID of the project which will be billed
    *     for the request.
+   *  @param {boolean} [softDeleted] If true, returns the soft-deleted object.
+   *     Object `generation` is required if `softDeleted` is set to True.
    */
   /**
    * @typedef {array} GetBucketsResponse
    * @property {Bucket[]} 0 Array of {@link Bucket} instances.
-   * @property {objcet} 1 nextQuery A query object to receive more results.
+   * @property {object} 1 nextQuery A query object to receive more results.
    * @property {object} 2 The full API response.
    */
   /**
@@ -1143,8 +1337,9 @@ export class Storage extends Service {
           return;
         }
 
-        const buckets = arrify(resp.items).map((bucket: Metadata) => {
-          const bucketInstance = this.bucket(bucket.id);
+        const itemsArray = resp.items ? resp.items : [];
+        const buckets = itemsArray.map((bucket: BucketMetadata) => {
+          const bucketInstance = this.bucket(bucket.id!);
           bucketInstance.metadata = bucket;
           return bucketInstance;
         });
@@ -1264,8 +1459,9 @@ export class Storage extends Service {
           return;
         }
 
-        const hmacKeys = arrify(resp.items).map((hmacKey: HmacKeyMetadata) => {
-          const hmacKeyInstance = this.hmacKey(hmacKey.accessId, {
+        const itemsArray = resp.items ? resp.items : [];
+        const hmacKeys = itemsArray.map((hmacKey: HmacKeyMetadata) => {
+          const hmacKeyInstance = this.hmacKey(hmacKey.accessId!, {
             projectId: hmacKey.projectId,
           });
           hmacKeyInstance.metadata = hmacKey;
@@ -1386,7 +1582,7 @@ export class Storage extends Service {
    * supply the project's ID as `projectId` in the `options` argument.
    *
    * @param {string} accessId The HMAC key's access ID.
-   * @param {HmacKeyOptions} options HmacKey constructor owptions.
+   * @param {HmacKeyOptions} options HmacKey constructor options.
    * @returns {HmacKey}
    * @see HmacKey
    *
@@ -1399,7 +1595,7 @@ export class Storage extends Service {
    */
   hmacKey(accessId: string, options?: HmacKeyOptions) {
     if (!accessId) {
-      throw new Error('An access ID is needed to create an HmacKey object.');
+      throw new Error(StorageExceptionMessages.HMAC_ACCESS_ID);
     }
 
     return new HmacKey(this, accessId, options);

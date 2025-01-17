@@ -23,20 +23,45 @@ const uuid = require('uuid');
 const execSync = cmd => cp.execSync(cmd, {encoding: 'utf-8'});
 
 const storage = new Storage();
-const bucketName = `nodejs-storage-samples-${uuid.v4()}`;
-const bucketNameWithClassAndLocation = `nodejs-storage-samples-${uuid.v4()}`;
+const samplesTestBucketPrefix = `nodejs-storage-samples-${uuid.v4()}`;
+const bucketName = `${samplesTestBucketPrefix}-a`;
+const bucketNameDualRegion = `${samplesTestBucketPrefix}-b`;
+const bucketNameDualRegionTurbo = `${samplesTestBucketPrefix}-c`;
+const bucketNameWithClassAndLocation = `${samplesTestBucketPrefix}-d`;
+const bucketNameAutoclass = `${samplesTestBucketPrefix}-e`;
+const bucketNameObjectRetention = `${samplesTestBucketPrefix}-f`;
+const bucketNameHierarchicalNamespace = `${samplesTestBucketPrefix}-g`;
 const defaultKmsKeyName = process.env.GOOGLE_CLOUD_KMS_KEY_ASIA;
 const bucket = storage.bucket(bucketName);
 const bucketWithClassAndLocation = storage.bucket(
   bucketNameWithClassAndLocation
 );
+const dualRegionBucket = storage.bucket(bucketNameDualRegion);
+const dualRegionBucketTurbo = storage.bucket(bucketNameDualRegionTurbo);
+const objectRetentionBucket = storage.bucket(bucketNameObjectRetention);
 
 const PUBLIC_ACCESS_PREVENTION_INHERITED = 'inherited';
 const PUBLIC_ACCESS_PREVENTION_ENFORCED = 'enforced';
 
-after(async () => {
-  await bucket.delete().catch(console.error);
-  await bucketWithClassAndLocation.delete().catch(console.error);
+const DUAL_REGION = {
+  LOCATION: 'US',
+  REGIONS: ['US-EAST1', 'US-WEST1'],
+};
+const RPO_ASYNC_TURBO = 'ASYNC_TURBO';
+const RPO_DEFAULT = 'DEFAULT';
+
+async function deleteAllBucketsAsync() {
+  const [buckets] = await storage.getBuckets({prefix: samplesTestBucketPrefix});
+
+  for (const bucket of buckets) {
+    await bucket.deleteFiles({force: true});
+    await bucket.delete({ignoreNotFound: true});
+  }
+}
+
+after(deleteAllBucketsAsync);
+afterEach(async () => {
+  await new Promise(res => setTimeout(res, 1000));
 });
 
 it('should create a bucket', async () => {
@@ -55,6 +80,31 @@ it('should list buckets', () => {
 it('should get bucket metadata', async () => {
   const output = execSync(`node bucketMetadata.js ${bucketName}`);
   assert.include(output, bucketName);
+});
+
+it('should set autoclass terminal storage class to ARCHIVE', async () => {
+  await storage.createBucket(bucketNameAutoclass, {
+    autoclass: {
+      enabled: true,
+      terminalStorageClass: 'NEARLINE',
+    },
+  });
+  const output = execSync(
+    `node setAutoclass.js ${bucketNameAutoclass} ${true} ARCHIVE`
+  );
+  assert.include(output, 'ARCHIVE');
+});
+
+it('should disable autoclass', async () => {
+  const output = execSync(
+    `node setAutoclass.js ${bucketNameAutoclass} ${false}`
+  );
+  assert.include(output, 'Autoclass');
+});
+
+it('should get autoclass', async () => {
+  const output = execSync(`node getAutoclass.js ${bucketNameAutoclass}`);
+  assert.include(output, `Autoclass is disabled for ${bucketNameAutoclass}`);
 });
 
 it('should set a buckets default KMS key', async () => {
@@ -200,6 +250,105 @@ it('should set public access prevention to inherited', async () => {
   );
 });
 
+it('should create a dual-region bucket', async () => {
+  const output = execSync(
+    `node createBucketWithDualRegion.js ${bucketNameDualRegion} ${DUAL_REGION.LOCATION} ${DUAL_REGION.REGIONS[0]} ${DUAL_REGION.REGIONS[1]}`
+  );
+
+  // Ensure the sample outputs the desired result
+  assert.include(output, bucketNameDualRegion);
+  assert.include(output, DUAL_REGION.LOCATION);
+  assert.include(output, DUAL_REGION.REGIONS[0]);
+  assert.include(output, DUAL_REGION.REGIONS[1]);
+  assert.include(output, 'dual-region');
+
+  // Make API request for further verification
+  const [exists] = await dualRegionBucket.exists();
+  assert.strictEqual(exists, true);
+
+  const [metadata] = await dualRegionBucket.getMetadata();
+
+  assert.strictEqual(metadata.location, DUAL_REGION.LOCATION);
+
+  assert(metadata.customPlacementConfig);
+  assert(Array.isArray(metadata.customPlacementConfig.dataLocations));
+
+  const dataLocations = metadata.customPlacementConfig.dataLocations;
+
+  assert(dataLocations.includes(DUAL_REGION.REGIONS[0]));
+  assert(dataLocations.includes(DUAL_REGION.REGIONS[1]));
+
+  assert.strictEqual(metadata.locationType, 'dual-region');
+});
+
+it('should create a dual-region bucket with turbo replication enabled', async () => {
+  const output = execSync(
+    `node createBucketWithTurboReplication.js ${bucketNameDualRegionTurbo}`
+  );
+  assert.match(
+    output,
+    new RegExp(
+      `${bucketNameDualRegionTurbo} created with the recovery point objective \\(RPO\\) set to ASYNC_TURBO in NAM4.`
+    )
+  );
+  const [exists] = await dualRegionBucketTurbo.exists();
+  assert.strictEqual(exists, true);
+});
+
+it("should get a bucket's RPO metadata", async () => {
+  await storage.bucket(bucketNameDualRegionTurbo).setMetadata({
+    rpo: RPO_ASYNC_TURBO,
+  });
+
+  const output = execSync(`node getRPO.js ${bucketNameDualRegionTurbo}`);
+  assert.match(
+    output,
+    new RegExp(`RPO is ASYNC_TURBO for ${bucketNameDualRegionTurbo}.`)
+  );
+
+  const metadata = await dualRegionBucketTurbo.getMetadata();
+  assert.strictEqual(metadata[0].rpo, RPO_ASYNC_TURBO);
+});
+
+it("should set a bucket's RPO to ASYNC_TURBO", async () => {
+  const output = execSync(
+    `node setRPOAsyncTurbo.js ${bucketNameDualRegionTurbo}`
+  );
+  assert.match(
+    output,
+    new RegExp(`Turbo replication enabled for ${bucketNameDualRegionTurbo}.`)
+  );
+
+  const metadata = await dualRegionBucketTurbo.getMetadata();
+  assert.strictEqual(metadata[0].rpo, RPO_ASYNC_TURBO);
+});
+
+it("should set a bucket's RPO to DEFAULT", async () => {
+  const output = execSync(`node setRPODefault.js ${bucketNameDualRegionTurbo}`);
+  assert.match(
+    output,
+    new RegExp(`Turbo replication disabled for ${bucketNameDualRegionTurbo}.`)
+  );
+
+  const metadata = await dualRegionBucketTurbo.getMetadata();
+  assert.strictEqual(metadata[0].rpo, RPO_DEFAULT);
+});
+
+it('should create a hierarchical namespace enabled bucket', async () => {
+  const output = execSync(
+    `node createBucketWithHierarchicalNamespace.js ${bucketNameHierarchicalNamespace}`
+  );
+  assert.match(
+    output,
+    new RegExp(
+      `Created '${bucketNameHierarchicalNamespace}' with hierarchical namespace enabled.`
+    )
+  );
+
+  const metadata = await dualRegionBucketTurbo.getMetadata();
+  assert.strictEqual(metadata[0].rpo, RPO_DEFAULT);
+});
+
 it("should add a bucket's website configuration", async () => {
   const output = execSync(
     `node addBucketWebsiteConfiguration.js ${bucketName} http://example.com http://example.com/404.html`
@@ -288,4 +437,16 @@ it('should delete a bucket', async () => {
   assert.match(output, new RegExp(`Bucket ${bucketName} deleted`));
   const [exists] = await bucket.exists();
   assert.strictEqual(exists, false);
+});
+
+it('should create a bucket with object retention enabled', async () => {
+  const output = execSync(
+    `node createBucketWithObjectRetention.js ${bucketNameObjectRetention}`
+  );
+  assert.include(
+    output,
+    `Created '${bucketNameObjectRetention}' with object retention enabled setting: Enabled`
+  );
+  const [metadata] = await objectRetentionBucket.getMetadata();
+  assert.strictEqual(metadata.objectRetention.mode, 'Enabled');
 });

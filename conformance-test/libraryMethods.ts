@@ -12,277 +12,322 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {Bucket, File, Notification, Storage, HmacKey} from '../src';
+import {Bucket, File, Notification, Storage, HmacKey, Policy} from '../src';
 import * as path from 'path';
-import {ApiError} from '@google-cloud/common';
+import {ApiError} from '../src/nodejs-common';
+import {
+  createTestBuffer,
+  createTestFileFromBuffer,
+  deleteTestFile,
+} from './testBenchUtil';
+import * as uuid from 'uuid';
+import {getDirName} from '../src/util.js';
+
+const FILE_SIZE_BYTES = 9 * 1024 * 1024;
+const CHUNK_SIZE_BYTES = 2 * 1024 * 1024;
+
+export interface ConformanceTestOptions {
+  bucket?: Bucket;
+  file?: File;
+  notification?: Notification;
+  storage?: Storage;
+  hmacKey?: HmacKey;
+  preconditionRequired?: boolean;
+}
 
 /////////////////////////////////////////////////
 //////////////////// BUCKET /////////////////////
 /////////////////////////////////////////////////
 
-export async function addLifecycleRule(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function addLifecycleRuleInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.addLifecycleRule({
-    action: 'delete',
+  await options.bucket!.addLifecycleRule({
+    action: {
+      type: 'Delete',
+    },
     condition: {
       age: 365 * 3, // Specified in days.
     },
   });
 }
 
-export async function combine(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function addLifecycleRule(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.addLifecycleRule(
+      {
+        action: {
+          type: 'Delete',
+        },
+        condition: {
+          age: 365 * 3, // Specified in days.
+        },
+      },
+      {
+        ifMetagenerationMatch: 2,
+      }
+    );
+  } else {
+    await options.bucket!.addLifecycleRule({
+      action: {
+        type: 'Delete',
+      },
+      condition: {
+        age: 365 * 3, // Specified in days.
+      },
+    });
+  }
+}
+
+export async function combineInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  const file1 = bucket.file('file1.txt');
-  const file2 = bucket.file('file2.txt');
+  const file1 = options.bucket!.file('file1.txt');
+  const file2 = options.bucket!.file('file2.txt');
   await file1.save('file1 contents');
   await file2.save('file2 contents');
-  const f1WithPrecondition = new File(file1.bucket, file1.name, {
-    preconditionOpts: {
-      ifGenerationMatch: file1.metadata.generation,
-    },
-  });
-  const f2WithPrecondition = new File(file2.bucket, file2.name, {
-    preconditionOpts: {
-      ifGenerationMatch: file2.metadata.generation,
-    },
-  });
-  const sources = [f1WithPrecondition, f2WithPrecondition];
-  const allFiles = bucket.file('all-files.txt');
-  await bucket.combine(sources, allFiles);
+  let allFiles;
+  const sources = [file1, file2];
+  if (options.preconditionRequired) {
+    allFiles = options.bucket!.file('all-files.txt', {
+      preconditionOpts: {
+        ifGenerationMatch: 0,
+      },
+    });
+  } else {
+    allFiles = options.bucket!.file('all-files.txt');
+  }
+
+  await options.bucket!.combine(sources, allFiles);
 }
 
-export async function create(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function combine(options: ConformanceTestOptions) {
+  const file1 = options.bucket!.file('file1.txt');
+  const file2 = options.bucket!.file('file2.txt');
+  await file1.save('file1 contents');
+  await file2.save('file2 contents');
+  const sources = [file1, file2];
+  const allFiles = options.bucket!.file('all-files.txt');
+  await allFiles.save('allfiles contents');
+  if (options.preconditionRequired) {
+    await options.bucket!.combine(sources, allFiles, {
+      ifGenerationMatch: allFiles.metadata.generation!,
+    });
+  } else {
+    await options.bucket!.combine(sources, allFiles);
+  }
+}
+
+export async function create(options: ConformanceTestOptions) {
+  const [bucketExists] = await options.bucket!.exists();
+  if (bucketExists) {
+    await options.bucket!.deleteFiles();
+    await options.bucket!.delete({
+      ignoreNotFound: true,
+    });
+  }
+  await options.bucket!.create();
+}
+
+export async function createNotification(options: ConformanceTestOptions) {
+  await options.bucket!.createNotification('my-topic');
+}
+
+export async function deleteBucket(options: ConformanceTestOptions) {
+  await options.bucket!.deleteFiles();
+  await options.bucket!.delete();
+}
+
+// Note: bucket.deleteFiles is missing from these tests
+// Preconditions cannot be implemented with current setup.
+
+export async function deleteLabelsInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.create();
+  await options.bucket!.deleteLabels();
 }
 
-export async function createNotification(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function deleteLabels(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.deleteLabels({
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.deleteLabels();
+  }
+}
+
+export async function disableRequesterPaysInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.createNotification('my-topic');
+  await options.bucket!.disableRequesterPays();
 }
 
-export async function deleteBucket(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.deleteFiles();
-  await bucket.delete();
+export async function disableRequesterPays(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.disableRequesterPays({
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.disableRequesterPays();
+  }
 }
 
-export async function deleteFiles(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.deleteFiles();
-}
-
-export async function deleteLabels(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.deleteLabels();
-}
-
-export async function disableRequesterPays(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.disableRequesterPays();
-}
-
-export async function enableLogging(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function enableLoggingInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
   const config = {
     prefix: 'log',
   };
-  await bucket.enableLogging(config);
+  await options.bucket!.enableLogging(config);
 }
 
-export async function enableRequesterPays(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.enableRequesterPays();
+export async function enableLogging(options: ConformanceTestOptions) {
+  let config;
+  if (options.preconditionRequired) {
+    config = {
+      prefix: 'log',
+      ifMetagenerationMatch: 2,
+    };
+  } else {
+    config = {
+      prefix: 'log',
+    };
+  }
+  await options.bucket!.enableLogging(config);
 }
 
-export async function bucketExists(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function enableRequesterPaysInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.exists();
+  await options.bucket!.enableRequesterPays();
 }
 
-export async function bucketGet(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.get();
+export async function enableRequesterPays(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.enableRequesterPays({
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.enableRequesterPays();
+  }
 }
 
-export async function getFilesStream(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function bucketExists(options: ConformanceTestOptions) {
+  await options.bucket!.exists();
+}
+
+export async function bucketGet(options: ConformanceTestOptions) {
+  await options.bucket!.get();
+}
+
+export async function getFilesStream(options: ConformanceTestOptions) {
   return new Promise((resolve, reject) => {
-    bucket
-      .getFilesStream()
+    options
+      .bucket!.getFilesStream()
       .on('data', () => {})
       .on('end', () => resolve(undefined))
       .on('error', (err: ApiError) => reject(err));
   });
 }
 
-export async function getLabels(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.getLabels();
+export async function getLabels(options: ConformanceTestOptions) {
+  await options.bucket!.getLabels();
 }
 
-export async function bucketGetMetadata(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.getMetadata();
+export async function bucketGetMetadata(options: ConformanceTestOptions) {
+  await options.bucket!.getMetadata();
 }
 
-export async function getNotifications(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.getNotifications();
+export async function getNotifications(options: ConformanceTestOptions) {
+  await options.bucket!.getNotifications();
 }
 
-export async function lock(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function lock(options: ConformanceTestOptions) {
   const metageneration = 0;
-  await bucket.lock(metageneration);
+  await options.bucket!.lock(metageneration);
 }
 
-export async function bucketMakePrivate(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function bucketMakePrivateInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.makePrivate();
+  await options.bucket!.makePrivate();
 }
 
-export async function bucketMakePublic(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function bucketMakePrivate(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.makePrivate({
+      preconditionOpts: {ifMetagenerationMatch: 2},
+    });
+  } else {
+    await options.bucket!.makePrivate();
+  }
+}
+
+export async function bucketMakePublic(options: ConformanceTestOptions) {
+  await options.bucket!.makePublic();
+}
+
+export async function removeRetentionPeriodInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.makePublic();
+  await options.bucket!.removeRetentionPeriod();
 }
 
-export async function removeRetentionPeriod(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.removeRetentionPeriod();
+export async function removeRetentionPeriod(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.removeRetentionPeriod({
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.removeRetentionPeriod();
+  }
 }
 
-export async function setCorsConfiguration(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function setCorsConfigurationInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
   const corsConfiguration = [{maxAgeSeconds: 3600}]; // 1 hour
-  await bucket.setCorsConfiguration(corsConfiguration);
+  await options.bucket!.setCorsConfiguration(corsConfiguration);
 }
 
-export async function setLabels(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function setCorsConfiguration(options: ConformanceTestOptions) {
+  const corsConfiguration = [{maxAgeSeconds: 3600}]; // 1 hour
+  if (options.preconditionRequired) {
+    await options.bucket!.setCorsConfiguration(corsConfiguration, {
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.setCorsConfiguration(corsConfiguration);
+  }
+}
+
+export async function setLabelsInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
   const labels = {
     labelone: 'labelonevalue',
     labeltwo: 'labeltwovalue',
   };
-  await bucket.setLabels(labels);
+  await options.bucket!.setLabels(labels);
 }
 
-export async function bucketSetMetadata(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function setLabels(options: ConformanceTestOptions) {
+  const labels = {
+    labelone: 'labelonevalue',
+    labeltwo: 'labeltwovalue',
+  };
+  if (options.preconditionRequired) {
+    await options.bucket!.setLabels(labels, {
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.setLabels(labels);
+  }
+}
+
+export async function bucketSetMetadataInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
   const metadata = {
     website: {
@@ -290,253 +335,340 @@ export async function bucketSetMetadata(
       notFoundPage: 'http://example.com/404.html',
     },
   };
-  await bucket.setMetadata(metadata);
+  await options.bucket!.setMetadata(metadata);
 }
 
-export async function setRetentionPeriod(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function bucketSetMetadata(options: ConformanceTestOptions) {
+  const metadata = {
+    website: {
+      mainPageSuffix: 'http://example.com',
+      notFoundPage: 'http://example.com/404.html',
+    },
+  };
+  if (options.preconditionRequired) {
+    await options.bucket!.setMetadata(metadata, {
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.setMetadata(metadata);
+  }
+}
+
+export async function setRetentionPeriodInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
   const DURATION_SECONDS = 15780000; // 6 months.
-  await bucket.setRetentionPeriod(DURATION_SECONDS);
+  await options.bucket!.setRetentionPeriod(DURATION_SECONDS);
 }
 
-export async function bucketSetStorageClass(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.setStorageClass('nearline');
+export async function setRetentionPeriod(options: ConformanceTestOptions) {
+  const DURATION_SECONDS = 15780000; // 6 months.
+  if (options.preconditionRequired) {
+    await options.bucket!.setRetentionPeriod(DURATION_SECONDS, {
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.setRetentionPeriod(DURATION_SECONDS);
+  }
 }
 
-export async function bucketUploadResumable(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function bucketSetStorageClassInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.upload(
-    path.join(
-      __dirname,
-      '../../conformance-test/test-data/retryStrategyTestData.json'
-    ),
-    {resumable: true}
+  await options.bucket!.setStorageClass('nearline');
+}
+
+export async function bucketSetStorageClass(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.bucket!.setStorageClass('nearline', {
+      ifMetagenerationMatch: 2,
+    });
+  } else {
+    await options.bucket!.setStorageClass('nearline');
+  }
+}
+
+export async function bucketUploadResumableInstancePrecondition(
+  options: ConformanceTestOptions
+) {
+  const filePath = path.join(
+    getDirName(),
+    `../conformance-test/test-data/tmp-${uuid.v4()}.txt`
   );
+  createTestFileFromBuffer(FILE_SIZE_BYTES, filePath);
+  if (options.bucket!.instancePreconditionOpts) {
+    options.bucket!.instancePreconditionOpts.ifGenerationMatch = 0;
+    delete options.bucket!.instancePreconditionOpts.ifMetagenerationMatch;
+  }
+  await options.bucket!.upload(filePath, {
+    resumable: true,
+    chunkSize: CHUNK_SIZE_BYTES,
+    metadata: {contentLength: FILE_SIZE_BYTES},
+  });
+  deleteTestFile(filePath);
 }
 
-export async function bucketUploadMultipart(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function bucketUploadResumable(options: ConformanceTestOptions) {
+  const filePath = path.join(
+    getDirName(),
+    `../conformance-test/test-data/tmp-${uuid.v4()}.txt`
+  );
+  createTestFileFromBuffer(FILE_SIZE_BYTES, filePath);
+  if (options.preconditionRequired) {
+    await options.bucket!.upload(filePath, {
+      resumable: true,
+      chunkSize: CHUNK_SIZE_BYTES,
+      metadata: {contentLength: FILE_SIZE_BYTES},
+      preconditionOpts: {ifGenerationMatch: 0},
+    });
+  } else {
+    await options.bucket!.upload(filePath, {
+      resumable: true,
+      chunkSize: CHUNK_SIZE_BYTES,
+      metadata: {contentLength: FILE_SIZE_BYTES},
+    });
+  }
+  deleteTestFile(filePath);
+}
+
+export async function bucketUploadMultipartInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await bucket.upload(
+  if (options.bucket!.instancePreconditionOpts) {
+    delete options.bucket!.instancePreconditionOpts.ifMetagenerationMatch;
+    options.bucket!.instancePreconditionOpts.ifGenerationMatch = 0;
+  }
+  await options.bucket!.upload(
     path.join(
-      __dirname,
-      '../../conformance-test/test-data/retryStrategyTestData.json'
+      getDirName(),
+      '../../../conformance-test/test-data/retryStrategyTestData.json'
     ),
     {resumable: false}
   );
+}
+
+export async function bucketUploadMultipart(options: ConformanceTestOptions) {
+  if (options.bucket!.instancePreconditionOpts) {
+    delete options.bucket!.instancePreconditionOpts.ifMetagenerationMatch;
+  }
+
+  if (options.preconditionRequired) {
+    await options.bucket!.upload(
+      path.join(
+        getDirName(),
+        '../../../conformance-test/test-data/retryStrategyTestData.json'
+      ),
+      {resumable: false, preconditionOpts: {ifGenerationMatch: 0}}
+    );
+  } else {
+    await options.bucket!.upload(
+      path.join(
+        getDirName(),
+        '../../../conformance-test/test-data/retryStrategyTestData.json'
+      ),
+      {resumable: false}
+    );
+  }
 }
 
 /////////////////////////////////////////////////
 //////////////////// FILE /////////////////////
 /////////////////////////////////////////////////
 
-export async function copy(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.copy('a-different-file.png');
+export async function copy(options: ConformanceTestOptions) {
+  const newFile = new File(options.bucket!, 'a-different-file.png');
+  await newFile.save('a-different-file.png');
+
+  if (options.preconditionRequired) {
+    await options.file!.copy('a-different-file.png', {
+      preconditionOpts: {
+        ifGenerationMatch: newFile.metadata.generation!,
+      },
+    });
+  } else {
+    await options.file!.copy('a-different-file.png');
+  }
 }
 
-export async function createReadStream(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function createReadStream(options: ConformanceTestOptions) {
   return new Promise((resolve, reject) => {
-    file
-      .createReadStream()
+    options
+      .file!.createReadStream()
       .on('data', () => {})
       .on('end', () => resolve(undefined))
       .on('error', (err: ApiError) => reject(err));
   });
 }
 
-export async function createResumableUpload(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function createResumableUploadInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await file.createResumableUpload();
+  await options.file!.createResumableUpload();
 }
 
-export async function fileDelete(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.delete();
+export async function createResumableUpload(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.createResumableUpload({
+      preconditionOpts: {ifGenerationMatch: 0},
+    });
+  } else {
+    await options.file!.createResumableUpload();
+  }
 }
 
-export async function download(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function fileDeleteInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await file.download();
+  await options.file!.delete();
 }
 
-export async function exists(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.exists();
+export async function fileDelete(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.delete({
+      ifGenerationMatch: options.file!.metadata.generation,
+    });
+  } else {
+    await options.file!.delete();
+  }
 }
 
-export async function get(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.get();
+export async function download(options: ConformanceTestOptions) {
+  await options.file!.download();
 }
 
-export async function getExpirationDate(
-  bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.getExpirationDate();
+export async function exists(options: ConformanceTestOptions) {
+  await options.file!.exists();
 }
 
-export async function getMetadata(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.getMetadata();
+export async function get(options: ConformanceTestOptions) {
+  await options.file!.get();
 }
 
-export async function isPublic(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.isPublic();
+export async function getExpirationDate(options: ConformanceTestOptions) {
+  await options.file!.getExpirationDate();
 }
 
-export async function fileMakePrivate(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.makePrivate();
+export async function getMetadata(options: ConformanceTestOptions) {
+  await options.file!.getMetadata();
 }
 
-export async function fileMakePublic(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.makePublic();
+export async function isPublic(options: ConformanceTestOptions) {
+  await options.file!.isPublic();
 }
 
-export async function move(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function fileMakePrivateInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await file.move('new-file');
+  await options.file!.makePrivate();
 }
 
-export async function rename(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.rename('new-name');
+export async function fileMakePrivate(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.makePrivate({
+      preconditionOpts: {
+        ifMetagenerationMatch: options.file!.metadata.metageneration,
+      },
+    });
+  } else {
+    await options.file!.makePrivate();
+  }
 }
 
-export async function rotateEncryptionKey(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function fileMakePublic(options: ConformanceTestOptions) {
+  await options.file!.makePublic();
+}
+
+export async function move(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.move('new-file', {
+      preconditionOpts: {ifGenerationMatch: 0},
+    });
+  } else {
+    await options.file!.move('new-file');
+  }
+}
+
+export async function rename(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.rename('new-name', {
+      preconditionOpts: {ifGenerationMatch: 0},
+    });
+  } else {
+    await options.file!.rename('new-name');
+  }
+}
+
+export async function rotateEncryptionKey(options: ConformanceTestOptions) {
   const crypto = require('crypto');
   const buffer = crypto.randomBytes(32);
   const newKey = buffer.toString('base64');
-  await file.rotateEncryptionKey({
-    encryptionKey: Buffer.from(newKey, 'base64'),
+  if (options.preconditionRequired) {
+    await options.file!.rotateEncryptionKey({
+      encryptionKey: Buffer.from(newKey, 'base64'),
+      preconditionOpts: {ifGenerationMatch: options.file!.metadata.generation},
+    });
+  } else {
+    await options.file!.rotateEncryptionKey({
+      encryptionKey: Buffer.from(newKey, 'base64'),
+    });
+  }
+}
+
+export async function saveResumableInstancePrecondition(
+  options: ConformanceTestOptions
+) {
+  const buf = createTestBuffer(FILE_SIZE_BYTES);
+  await options.file!.save(buf, {
+    resumable: true,
+    chunkSize: CHUNK_SIZE_BYTES,
+    metadata: {contentLength: FILE_SIZE_BYTES},
   });
 }
 
-export async function saveResumable(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await file.save('testdata', {resumable: true});
+export async function saveResumable(options: ConformanceTestOptions) {
+  const buf = createTestBuffer(FILE_SIZE_BYTES);
+  if (options.preconditionRequired) {
+    await options.file!.save(buf, {
+      resumable: true,
+      chunkSize: CHUNK_SIZE_BYTES,
+      metadata: {contentLength: FILE_SIZE_BYTES},
+      preconditionOpts: {
+        ifGenerationMatch: options.file!.metadata.generation,
+        ifMetagenerationMatch: options.file!.metadata.metageneration,
+      },
+    });
+  } else {
+    await options.file!.save(buf, {
+      resumable: true,
+      chunkSize: CHUNK_SIZE_BYTES,
+      metadata: {contentLength: FILE_SIZE_BYTES},
+    });
+  }
 }
 
-export async function saveMultipart(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function saveMultipartInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
-  await file.save('testdata', {resumable: false});
+  await options.file!.save('testdata', {resumable: false});
 }
 
-export async function setMetadata(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
+export async function saveMultipart(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.save('testdata', {
+      resumable: false,
+      preconditionOpts: {
+        ifGenerationMatch: options.file!.metadata.generation,
+      },
+    });
+  } else {
+    await options.file!.save('testdata', {
+      resumable: false,
+    });
+  }
+}
+
+export async function setMetadataInstancePrecondition(
+  options: ConformanceTestOptions
 ) {
   const metadata = {
     contentType: 'application/x-font-ttf',
@@ -545,19 +677,35 @@ export async function setMetadata(
       properties: 'go here',
     },
   };
-  await file.setMetadata(metadata);
+  await options.file!.setMetadata(metadata);
 }
 
-export async function setStorageClass(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  const result = await file.setStorageClass('nearline');
-  if (!result) {
-    throw Error();
+export async function setMetadata(options: ConformanceTestOptions) {
+  const metadata = {
+    contentType: 'application/x-font-ttf',
+    metadata: {
+      my: 'custom',
+      properties: 'go here',
+    },
+  };
+  if (options.preconditionRequired) {
+    await options.file!.setMetadata(metadata, {
+      ifMetagenerationMatch: options.file!.metadata.metageneration,
+    });
+  } else {
+    await options.file!.setMetadata(metadata);
+  }
+}
+
+export async function setStorageClass(options: ConformanceTestOptions) {
+  if (options.preconditionRequired) {
+    await options.file!.setStorageClass('nearline', {
+      preconditionOpts: {
+        ifGenerationMatch: options.file!.metadata.generation,
+      },
+    });
+  } else {
+    await options.file!.setStorageClass('nearline');
   }
 }
 
@@ -565,75 +713,39 @@ export async function setStorageClass(
 // /////////////////// HMAC KEY ////////////////////
 // /////////////////////////////////////////////////
 
-export async function deleteHMAC(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  hmacKey: HmacKey
-) {
+export async function deleteHMAC(options: ConformanceTestOptions) {
   const metadata = {
     state: 'INACTIVE',
   };
-  hmacKey.setMetadata(metadata);
-  await hmacKey.delete();
+  await options.hmacKey!.setMetadata(metadata);
+  await options.hmacKey!.delete();
 }
 
-export async function getHMAC(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  hmacKey: HmacKey
-) {
-  await hmacKey.get();
+export async function getHMAC(options: ConformanceTestOptions) {
+  await options.hmacKey!.get();
 }
 
-export async function getMetadataHMAC(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  hmacKey: HmacKey
-) {
-  await hmacKey.getMetadata();
+export async function getMetadataHMAC(options: ConformanceTestOptions) {
+  await options.hmacKey!.getMetadata();
 }
 
-export async function setMetadataHMAC(
-  _bucket: Bucket,
-  file: File,
-  _notification: Notification,
-  _storage: Storage,
-  hmacKey: HmacKey
-) {
+export async function setMetadataHMAC(options: ConformanceTestOptions) {
   const metadata = {
     state: 'INACTIVE',
   };
-  await hmacKey.setMetadata(metadata);
+  await options.hmacKey!.setMetadata(metadata);
 }
 
 /////////////////////////////////////////////////
 ////////////////////// IAM //////////////////////
 /////////////////////////////////////////////////
 
-export async function iamGetPolicy(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await bucket.iam.getPolicy({requestedPolicyVersion: 1});
+export async function iamGetPolicy(options: ConformanceTestOptions) {
+  await options.bucket!.iam.getPolicy({requestedPolicyVersion: 1});
 }
 
-export async function iamSetPolicy(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  const testPolicy = {
+export async function iamSetPolicy(options: ConformanceTestOptions) {
+  const testPolicy: Policy = {
     bindings: [
       {
         role: 'roles/storage.admin',
@@ -641,147 +753,84 @@ export async function iamSetPolicy(
       },
     ],
   };
-  await bucket.iam.setPolicy(testPolicy);
+  if (options.preconditionRequired) {
+    const currentPolicy = await options.bucket!.iam.getPolicy();
+    testPolicy.etag = currentPolicy[0].etag;
+  }
+  await options.bucket!.iam.setPolicy(testPolicy);
 }
 
-export async function iamTestPermissions(
-  bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function iamTestPermissions(options: ConformanceTestOptions) {
   const permissionToTest = 'storage.buckets.delete';
-  await bucket.iam.testPermissions(permissionToTest);
+  await options.bucket!.iam.testPermissions(permissionToTest);
 }
 
 /////////////////////////////////////////////////
 ///////////////// NOTIFICATION //////////////////
 /////////////////////////////////////////////////
 
-export async function notificationDelete(
-  _bucket: Bucket,
-  _file: File,
-  notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await notification.delete();
+export async function notificationDelete(options: ConformanceTestOptions) {
+  await options.notification!.delete();
 }
 
-export async function notificationCreate(
-  _bucket: Bucket,
-  _file: File,
-  notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await notification.create();
+export async function notificationCreate(options: ConformanceTestOptions) {
+  await options.notification!.create();
 }
 
-export async function notificationExists(
-  _bucket: Bucket,
-  _file: File,
-  notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await notification.exists();
+export async function notificationExists(options: ConformanceTestOptions) {
+  await options.notification!.exists();
 }
 
-export async function notificationGet(
-  _bucket: Bucket,
-  _file: File,
-  notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await notification.get();
+export async function notificationGet(options: ConformanceTestOptions) {
+  await options.notification!.get();
 }
 
-export async function notificationGetMetadata(
-  _bucket: Bucket,
-  _file: File,
-  notification: Notification,
-  _storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await notification.getMetadata();
+export async function notificationGetMetadata(options: ConformanceTestOptions) {
+  await options.notification!.getMetadata();
 }
 
 /////////////////////////////////////////////////
 /////////////////// STORAGE /////////////////////
 /////////////////////////////////////////////////
 
-export async function createBucket(
-  _bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await storage.createBucket('test-creating-bucket');
+export async function createBucket(options: ConformanceTestOptions) {
+  const bucket = options.storage!.bucket('test-creating-bucket');
+  const [exists] = await bucket.exists();
+  if (exists) {
+    bucket.delete();
+  }
+  await options.storage!.createBucket('test-creating-bucket');
 }
 
-export async function createHMACKey(
-  _bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function createHMACKey(options: ConformanceTestOptions) {
   const serviceAccountEmail = 'my-service-account@appspot.gserviceaccount.com';
-  await storage.createHmacKey(serviceAccountEmail);
+  await options.storage!.createHmacKey(serviceAccountEmail);
 }
 
-export async function getBuckets(
-  _bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await storage.getBuckets();
+export async function getBuckets(options: ConformanceTestOptions) {
+  await options.storage!.getBuckets();
 }
 
-export async function getBucketsStream(
-  _bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  storage: Storage,
-  _hmacKey: HmacKey
-) {
+export async function getBucketsStream(options: ConformanceTestOptions) {
   return new Promise((resolve, reject) => {
-    storage
-      .getBucketsStream()
+    options
+      .storage!.getBucketsStream()
       .on('data', () => {})
       .on('end', () => resolve(undefined))
       .on('error', err => reject(err));
   });
 }
 
-export function getHMACKeyStream(
-  _bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  storage: Storage,
-  _hmacKey: HmacKey
-) {
+export function getHMACKeyStream(options: ConformanceTestOptions) {
   return new Promise((resolve, reject) => {
-    storage
-      .getHmacKeysStream()
+    options
+      .storage!.getHmacKeysStream()
       .on('data', () => {})
       .on('end', () => resolve(undefined))
       .on('error', err => reject(err));
   });
 }
 
-export async function getServiceAccount(
-  _bucket: Bucket,
-  _file: File,
-  _notification: Notification,
-  storage: Storage,
-  _hmacKey: HmacKey
-) {
-  await storage.getServiceAccount();
+export async function getServiceAccount(options: ConformanceTestOptions) {
+  await options.storage!.getServiceAccount();
 }

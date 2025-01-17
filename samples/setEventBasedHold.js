@@ -20,7 +20,11 @@
  * at https://cloud.google.com/storage/docs/bucket-lock
  */
 
-function main(bucketName = 'my-bucket', fileName = 'test.txt') {
+function main(
+  bucketName = 'my-bucket',
+  fileName = 'test.txt',
+  metagenerationMatchPrecondition = 0
+) {
   // [START storage_set_event_based_hold]
   /**
    * TODO(developer): Uncomment the following lines before running the sample.
@@ -38,10 +42,20 @@ function main(bucketName = 'my-bucket', fileName = 'test.txt') {
   const storage = new Storage();
 
   async function setEventBasedHold() {
+    // Optional: set a meta-generation-match precondition to avoid potential race
+    // conditions and data corruptions. The request to set metadata is aborted if the
+    // object's metageneration number does not match your precondition.
+    const options = {
+      ifMetagenerationMatch: metagenerationMatchPrecondition,
+    };
+
     // Set event-based hold
-    await storage.bucket(bucketName).file(fileName).setMetadata({
-      eventBasedHold: true,
-    });
+    await storage.bucket(bucketName).file(fileName).setMetadata(
+      {
+        eventBasedHold: true,
+      },
+      options
+    );
     console.log(`Event-based hold was set for ${fileName}.`);
   }
 

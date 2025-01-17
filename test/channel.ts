@@ -17,13 +17,14 @@
  */
 
 import {
+  BaseMetadata,
   DecorateRequestOptions,
   ServiceObject,
   ServiceObjectConfig,
-} from '@google-cloud/common';
-import * as assert from 'assert';
+} from '../src/nodejs-common/index.js';
+import assert from 'assert';
 import {describe, it, before, beforeEach} from 'mocha';
-import * as proxyquire from 'proxyquire';
+import proxyquire from 'proxyquire';
 
 let promisified = false;
 const fakePromisify = {
@@ -34,7 +35,7 @@ const fakePromisify = {
   },
 };
 
-class FakeServiceObject extends ServiceObject {
+class FakeServiceObject extends ServiceObject<FakeServiceObject, BaseMetadata> {
   calledWith_: IArguments;
   constructor(config: ServiceObjectConfig) {
     super(config);
@@ -56,7 +57,7 @@ describe('Channel', () => {
   before(() => {
     Channel = proxyquire('../src/channel.js', {
       '@google-cloud/promisify': fakePromisify,
-      '@google-cloud/common': {
+      './nodejs-common': {
         ServiceObject: FakeServiceObject,
       },
     }).Channel;

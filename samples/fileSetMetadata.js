@@ -19,7 +19,11 @@
 //   description: Set file metadata.
 //   usage: node fileSetMetadata.js <BUCKET_NAME> <FILE_NAME>
 
-function main(bucketName = 'my-bucket', fileName = 'file.txt') {
+function main(
+  bucketName = 'my-bucket',
+  fileName = 'file.txt',
+  metagenerationMatchPrecondition = 0
+) {
   // [START storage_set_metadata]
   // Imports the Google Cloud client library
   const {Storage} = require('@google-cloud/storage');
@@ -37,23 +41,34 @@ function main(bucketName = 'my-bucket', fileName = 'file.txt') {
   // const fileName = 'your-file-name';
 
   async function setFileMetadata() {
+    // Optional: set a meta-generation-match precondition to avoid potential race
+    // conditions and data corruptions. The request to set metadata is aborted if the
+    // object's metageneration number does not match your precondition.
+    const options = {
+      ifMetagenerationMatch: metagenerationMatchPrecondition,
+    };
+
     // Set file metadata.
     const [metadata] = await storage
       .bucket(bucketName)
       .file(fileName)
-      .setMetadata({
-        // Predefinded metadata for server e.g. 'cacheControl', 'contentDisposition',
-        // 'contentEncoding', 'contentLanguage', 'contentType'
-        contentDisposition: 'attachment; filename*=utf-8\'\'"anotherImage.jpg"',
-        contentType: 'image/jpeg',
+      .setMetadata(
+        {
+          // Predefined metadata for server e.g. 'cacheControl', 'contentDisposition',
+          // 'contentEncoding', 'contentLanguage', 'contentType'
+          contentDisposition:
+            'attachment; filename*=utf-8\'\'"anotherImage.jpg"',
+          contentType: 'image/jpeg',
 
-        // A note or actionable items for user e.g. uniqueId, object description,
-        // or other useful information.
-        metadata: {
-          description: 'file description...',
-          modified: '1900-01-01',
+          // A note or actionable items for user e.g. uniqueId, object description,
+          // or other useful information.
+          metadata: {
+            description: 'file description...',
+            modified: '1900-01-01',
+          },
         },
-      });
+        options
+      );
 
     console.log(
       'Updated metadata for object',

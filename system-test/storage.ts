@@ -12,89 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import * as assert from 'assert';
-import {describe, it, before, beforeEach, after, afterEach} from 'mocha';
+import assert from 'assert';
+import {after, afterEach, before, beforeEach, describe, it} from 'mocha';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import fetch from 'node-fetch';
-import * as FormData from 'form-data';
-import pLimit = require('p-limit');
+import FormData from 'form-data';
+import pLimit from 'p-limit';
 import {promisify} from 'util';
 import * as path from 'path';
 import * as tmp from 'tmp';
 import * as uuid from 'uuid';
-import {util, ApiError, Metadata} from '@google-cloud/common';
+import {ApiError} from '../src/nodejs-common/index.js';
 import {
-  Storage,
-  Bucket,
-  File,
   AccessControlObject,
-  Notification,
-  GetNotificationOptions,
+  Bucket,
+  CRC32C,
   DeleteBucketCallback,
-  CreateNotificationOptions,
-  BucketExistsOptions,
-  BucketExistsCallback,
-  GetBucketOptions,
-  GetBucketCallback,
-  GetNotificationsCallback,
-  MakeBucketPrivateOptions,
-  MakeBucketPrivateCallback,
-  SetBucketMetadataOptions,
-  SetBucketMetadataCallback,
-  SaveCallback,
-  DownloadOptions,
-  DownloadCallback,
-  FileExistsOptions,
-  FileExistsCallback,
-  CreateReadStreamOptions,
-  CreateResumableUploadOptions,
-  GetFileOptions,
-  GetFileCallback,
-  SetStorageClassOptions,
-  SetStorageClassCallback,
+  File,
+  IdempotencyStrategy,
+  LifecycleRule,
+  Notification,
+  Storage,
   UploadOptions,
-  UploadCallback,
-  CopyOptions,
-  CopyCallback,
-  GetFileMetadataOptions,
-  GetFileMetadataCallback,
-  MakeFilePrivateOptions,
-  MakeFilePrivateCallback,
-  SetFileMetadataOptions,
-  SetFileMetadataCallback,
-  AddAclOptions,
-  AddAclCallback,
-  UpdateAclCallback,
-  UpdateAclOptions,
-  GetAclOptions,
-  GetAclCallback,
-  RemoveAclOptions,
-  RemoveAclCallback,
-  GetPolicyOptions,
-  GetPolicyCallback,
-  SetPolicyCallback,
-  TestIamPermissionsOptions,
-  TestIamPermissionsCallback,
-  GetNotificationCallback,
-  GetNotificationMetadataOptions,
-  GetNotificationMetadataCallback,
-  DeleteNotificationOptions,
-  DeleteNotificationCallback,
-} from '../src';
-import * as nock from 'nock';
+} from '../src/index.js';
+import nock from 'nock';
 import {Transform} from 'stream';
+import {gzipSync} from 'zlib';
 
 interface ErrorCallbackFunction {
   (err: Error | null): void;
 }
-import {PubSub} from '@google-cloud/pubsub';
-import {LifecycleRule} from '../src/bucket';
-import {IdempotencyStrategy} from '../src/storage';
+import {PubSub, Subscription, Topic} from '@google-cloud/pubsub';
+import {getDirName} from '../src/util.js';
+
+class HTTPError extends Error {
+  code: number;
+  constructor(message: string, code: number) {
+    super(message);
+    this.code = code;
+  }
+}
 
 // When set to true, skips all tests that is not compatible for
 // running inside VPCSC.
 const RUNNING_IN_VPCSC = !!process.env['GOOGLE_CLOUD_TESTS_IN_VPCSC'];
+
+const UNIFORM_ACCESS_TIMEOUT = 60 * 1000; // 60s see: https://cloud.google.com/storage/docs/consistency#eventually_consistent_operations
+const UNIFORM_ACCESS_WAIT_TIME = 5 * 1000; // 5s
+const BUCKET_METADATA_UPDATE_WAIT_TIME = 1250; // 1.25s buckets have a max rate of one metadata update per second.
 
 // block all attempts to chat with the metadata server (kokoro runs on GCE)
 nock('http://metadata.google.internal')
@@ -102,61 +68,63 @@ nock('http://metadata.google.internal')
   .replyWithError({code: 'ENOTFOUND'})
   .persist();
 
-describe('storage', () => {
+// eslint-disable-next-line prefer-arrow-callback
+describe('storage', function () {
+  this.retries(3);
+
   const USER_ACCOUNT = 'user-spsawchuk@gmail.com';
   const TESTS_PREFIX = `storage-tests-${shortUUID()}-`;
   const RETENTION_DURATION_SECONDS = 10;
 
   const storage = new Storage({
-    retryOptions: {idempotencyStrategy: IdempotencyStrategy.RetryAlways},
+    retryOptions: {
+      idempotencyStrategy: IdempotencyStrategy.RetryAlways,
+    },
   });
   const bucket = storage.bucket(generateName());
 
   const pubsub = new PubSub({
     projectId: process.env.PROJECT_ID,
   });
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let topic: any;
+  let topic: Topic;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const FILES: {[index: string]: any} = {
     logo: {
       path: path.join(
-        __dirname,
-        '../../system-test/data/CloudPlatform_128px_Retina.png'
+        getDirName(),
+        '../../../system-test/data/CloudPlatform_128px_Retina.png'
       ),
     },
     big: {
-      path: path.join(__dirname, '../../system-test/data/three-mb-file.tif'),
+      path: path.join(
+        getDirName(),
+        '../../../system-test/data/three-mb-file.tif'
+      ),
       hash: undefined,
     },
     html: {
-      path: path.join(__dirname, '../../system-test/data/long-html-file.html'),
-    },
-    gzip: {
       path: path.join(
-        __dirname,
-        '../../system-test/data/long-html-file.html.gz'
+        getDirName(),
+        '../../../system-test/data/long-html-file.html'
       ),
+    },
+    empty: {
+      path: path.join(getDirName(), '../../../system-test/data/empty-file.txt'),
     },
   };
 
-  before(() => {
-    return bucket
-      .create()
-      .then(() => {
-        return pubsub.createTopic(generateName());
-      })
-      .then(data => {
-        topic = data[0];
-        return topic.iam.setPolicy({
-          bindings: [
-            {
-              role: 'roles/pubsub.editor',
-              members: ['allUsers'],
-            },
-          ],
-        });
-      });
+  before(async () => {
+    await bucket.create();
+    const data = await pubsub.createTopic(generateName());
+    topic = data[0];
+    await topic.iam.setPolicy({
+      bindings: [
+        {
+          role: 'roles/pubsub.editor',
+          members: ['allUsers'],
+        },
+      ],
+    });
   });
 
   after(() => {
@@ -172,7 +140,7 @@ describe('storage', () => {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     let GOOGLE_CLOUD_PROJECT: string | undefined;
 
-    before(done => {
+    before(async () => {
       // CI authentication is done with ADC. Cache it here, restore it `after`
       GOOGLE_APPLICATION_CREDENTIALS =
         process.env.GOOGLE_APPLICATION_CREDENTIALS;
@@ -181,18 +149,18 @@ describe('storage', () => {
 
       privateBucket = bucket; // `bucket` was created in the global `before`
       privateFile = privateBucket.file('file-name');
-      privateFile.save('data', done);
+      await privateFile.save('data');
     });
 
     beforeEach(() => {
       delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
       delete process.env.GOOGLE_CLOUD_PROJECT;
-      delete require.cache[require.resolve('../src')];
 
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const {Storage} = require('../src');
       storageWithoutAuth = new Storage({
-        retryOptions: {idempotencyStrategy: IdempotencyStrategy.RetryAlways},
+        retryOptions: {
+          idempotencyStrategy: IdempotencyStrategy.RetryAlways,
+          retryDelayMultiplier: 3,
+        },
       });
     });
 
@@ -249,7 +217,9 @@ describe('storage', () => {
             /Could not load the default credentials/,
             /does not have storage\.objects\.create access/,
           ];
-          assert(allowedErrorMessages.some(msg => msg.test(e.message)));
+          assert(
+            allowedErrorMessages.some(msg => msg.test((e as Error).message))
+          );
         }
       });
     });
@@ -257,130 +227,79 @@ describe('storage', () => {
 
   describe('acls', () => {
     describe('buckets', () => {
-      it('should get access controls', done => {
-        bucket.acl.get((err, accessControls) => {
-          assert.ifError(err);
-          assert(Array.isArray(accessControls));
-          done();
-        });
-      });
-
-      it('should add entity to default access controls', done => {
-        bucket.acl.default.add(
-          {
-            entity: USER_ACCOUNT,
-            role: storage.acl.OWNER_ROLE,
-          },
-          (err, accessControl) => {
-            assert.ifError(err);
-            assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
-
-            bucket.acl.default.get(
-              {
-                entity: USER_ACCOUNT,
-              },
-              (err, accessControl) => {
-                assert.ifError(err);
-                assert.strictEqual(
-                  (accessControl as AccessControlObject)!.role,
-                  storage.acl.OWNER_ROLE
-                );
-
-                bucket.acl.default.update(
-                  {
-                    entity: USER_ACCOUNT,
-                    role: storage.acl.READER_ROLE,
-                  },
-                  (err, accessControl) => {
-                    assert.ifError(err);
-                    assert.strictEqual(
-                      (accessControl as AccessControlObject).role,
-                      storage.acl.READER_ROLE
-                    );
-
-                    bucket.acl.default.delete({entity: USER_ACCOUNT}, done);
-                  }
-                );
-              }
-            );
-          }
+      // Some bucket update operations have a rate limit.
+      // Introduce a delay between tests to avoid getting an error.
+      beforeEach(async () => {
+        await new Promise(resolve =>
+          setTimeout(resolve, BUCKET_METADATA_UPDATE_WAIT_TIME)
         );
       });
 
-      it('should get default access controls', done => {
-        bucket.acl.default.get((err, accessControls) => {
-          assert.ifError(err);
-          assert(Array.isArray(accessControls));
-          done();
+      it('should get access controls', async () => {
+        const accessControls = await bucket.acl.get();
+        assert(Array.isArray(accessControls));
+      });
+
+      it('should add entity to default access controls', async () => {
+        const [accessControl] = await bucket.acl.default.add({
+          entity: USER_ACCOUNT,
+          role: storage.acl.OWNER_ROLE,
         });
-      });
+        assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
 
-      it('should grant an account access', done => {
-        bucket.acl.add(
-          {
-            entity: USER_ACCOUNT,
-            role: storage.acl.OWNER_ROLE,
-          },
-          (err, accessControl) => {
-            assert.ifError(err);
-            assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
-
-            const opts = {entity: USER_ACCOUNT};
-
-            bucket.acl.get(opts, (err, accessControl) => {
-              assert.ifError(err);
-              assert.strictEqual(
-                (accessControl as AccessControlObject).role,
-                storage.acl.OWNER_ROLE
-              );
-
-              bucket.acl.delete(opts, done);
-            });
-          }
-        );
-      });
-
-      it('should update an account', done => {
-        bucket.acl.add(
-          {
-            entity: USER_ACCOUNT,
-            role: storage.acl.OWNER_ROLE,
-          },
-          (err, accessControl) => {
-            assert.ifError(err);
-            assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
-
-            bucket.acl.update(
-              {
-                entity: USER_ACCOUNT,
-                role: storage.acl.WRITER_ROLE,
-              },
-              (err, accessControl) => {
-                assert.ifError(err);
-                assert.strictEqual(
-                  accessControl!.role,
-                  storage.acl.WRITER_ROLE
-                );
-
-                bucket.acl.delete({entity: USER_ACCOUNT}, done);
-              }
-            );
-          }
-        );
-      });
-
-      it('should make a bucket public', done => {
-        bucket.makePublic(err => {
-          assert.ifError(err);
-          bucket.acl.get({entity: 'allUsers'}, (err, aclObject) => {
-            assert.ifError(err);
-            assert.deepStrictEqual(aclObject, {
-              entity: 'allUsers',
-              role: 'READER',
-            });
-            bucket.acl.delete({entity: 'allUsers'}, done);
-          });
+        const [updatedAccessControl] = await bucket.acl.default.update({
+          entity: USER_ACCOUNT,
+          role: storage.acl.READER_ROLE,
         });
+        assert.strictEqual(updatedAccessControl.role, storage.acl.READER_ROLE);
+        await bucket.acl.default.delete({entity: USER_ACCOUNT});
+      });
+
+      it('should get default access controls', async () => {
+        const accessControls = await bucket.acl.default.get();
+        assert(Array.isArray(accessControls));
+      });
+
+      it('should grant an account access', async () => {
+        const [accessControl] = await bucket.acl.add({
+          entity: USER_ACCOUNT,
+          role: storage.acl.OWNER_ROLE,
+        });
+        assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
+        const opts = {entity: USER_ACCOUNT};
+        const [accessControlGet] = await bucket.acl.get(opts);
+        assert.strictEqual(
+          (accessControlGet as AccessControlObject).role,
+          storage.acl.OWNER_ROLE
+        );
+        await bucket.acl.delete(opts);
+      });
+
+      it('should update an account', async () => {
+        const [accessControl] = await bucket.acl.add({
+          entity: USER_ACCOUNT,
+          role: storage.acl.OWNER_ROLE,
+        });
+        assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
+        const [updatedAcl] = await bucket.acl.update({
+          entity: USER_ACCOUNT,
+          role: storage.acl.WRITER_ROLE,
+        });
+        assert.strictEqual(updatedAcl!.role, storage.acl.WRITER_ROLE);
+        await bucket.acl.delete({entity: USER_ACCOUNT});
+      });
+
+      it('should make a bucket public', async () => {
+        await bucket.makePublic();
+        const [aclObject] = await bucket.acl.get({entity: 'allUsers'});
+        assert.deepStrictEqual(aclObject, {
+          entity: 'allUsers',
+          role: 'READER',
+        });
+        await new Promise(resolve =>
+          setTimeout(resolve, BUCKET_METADATA_UPDATE_WAIT_TIME)
+        );
+        await bucket.acl.delete({entity: 'allUsers'});
       });
 
       it('should make files public', async () => {
@@ -400,22 +319,20 @@ describe('storage', () => {
         ]);
       });
 
-      it('should make a bucket private', done => {
-        bucket.makePublic(err => {
-          assert.ifError(err);
-          bucket.makePrivate(err => {
-            assert.ifError(err);
-            bucket.acl.get({entity: 'allUsers'}, (err, aclObject) => {
-              assert.strictEqual((err as ApiError).code, 404);
-              assert.strictEqual(
-                (err as ApiError).errors![0].reason,
-                'notFound'
-              );
-              assert.strictEqual(aclObject, null);
-              done();
-            });
+      it('should make a bucket private', async () => {
+        try {
+          await bucket.makePublic();
+          await new Promise(resolve =>
+            setTimeout(resolve, BUCKET_METADATA_UPDATE_WAIT_TIME)
+          );
+          await bucket.makePrivate();
+          assert.rejects(bucket.acl.get({entity: 'allUsers'}), err => {
+            assert.strictEqual((err as ApiError).code, 404);
+            assert.strictEqual((err as ApiError).errors![0].reason, 'notFound');
           });
-        });
+        } catch (err) {
+          assert.ifError(err);
+        }
       });
 
       it('should make files private', async () => {
@@ -438,29 +355,20 @@ describe('storage', () => {
     describe('files', () => {
       let file: File;
 
-      beforeEach(done => {
+      beforeEach(async () => {
         const options = {
           destination: generateName() + '.png',
         };
-
-        bucket.upload(FILES.logo.path, options, (err, f) => {
-          assert.ifError(err);
-          file = f!;
-          done();
-        });
+        [file] = await bucket.upload(FILES.logo.path, options);
       });
 
-      afterEach(done => {
-        file.delete(done);
+      afterEach(async () => {
+        await file.delete();
       });
 
-      it('should get access controls', done => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        file.acl.get(done as any, (err, accessControls) => {
-          assert.ifError(err);
-          assert(Array.isArray(accessControls));
-          done();
-        });
+      it('should get access controls', async () => {
+        const [accessControls] = await file.acl.get();
+        assert(Array.isArray(accessControls));
       });
 
       it('should not expose default api', () => {
@@ -468,202 +376,122 @@ describe('storage', () => {
         assert.strictEqual(typeof (file as any).default, 'undefined');
       });
 
-      it('should grant an account access', done => {
-        file.acl.add(
-          {
-            entity: USER_ACCOUNT,
-            role: storage.acl.OWNER_ROLE,
-          },
-          (err, accessControl) => {
-            assert.ifError(err);
-            assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
+      it('should grant an account access', async () => {
+        const [accessControl] = await file.acl.add({
+          entity: USER_ACCOUNT,
+          role: storage.acl.OWNER_ROLE,
+        });
+        assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
+        const [accessControlGet] = await file.acl.get({entity: USER_ACCOUNT});
+        assert.strictEqual(
+          (accessControlGet as AccessControlObject).role,
+          storage.acl.OWNER_ROLE
+        );
+        await file.acl.delete({entity: USER_ACCOUNT});
+      });
 
-            file.acl.get({entity: USER_ACCOUNT}, (err, accessControl) => {
-              assert.ifError(err);
-              assert.strictEqual(
-                (accessControl as AccessControlObject).role,
-                storage.acl.OWNER_ROLE
-              );
+      it('should update an account', async () => {
+        const [accessControl] = await file.acl.add({
+          entity: USER_ACCOUNT,
+          role: storage.acl.OWNER_ROLE,
+        });
+        assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
+        const [accessControlUpdate] = await file.acl.update({
+          entity: USER_ACCOUNT,
+          role: storage.acl.READER_ROLE,
+        });
+        assert.strictEqual(accessControlUpdate!.role, storage.acl.READER_ROLE);
+        await file.acl.delete({entity: USER_ACCOUNT});
+      });
 
-              file.acl.delete({entity: USER_ACCOUNT}, done);
-            });
-          }
+      it('should make a file public', async () => {
+        await file.makePublic();
+        const [aclObject] = await file.acl.get({entity: 'allUsers'});
+        assert.deepStrictEqual(aclObject, {
+          entity: 'allUsers',
+          role: 'READER',
+        });
+        await file.acl.delete({entity: 'allUsers'});
+      });
+
+      it('should make a file private', async () => {
+        const validateMakeFilePrivateRejects = (err: ApiError) => {
+          assert.strictEqual(err.code, 404);
+          assert.strictEqual(err!.errors![0].reason, 'notFound');
+          return true;
+        };
+        assert.doesNotReject(file.makePublic());
+        assert.doesNotReject(file.makePrivate());
+        assert.rejects(
+          file.acl.get({entity: 'allUsers'}),
+          validateMakeFilePrivateRejects
         );
       });
 
-      it('should update an account', done => {
-        file.acl.add(
-          {
-            entity: USER_ACCOUNT,
-            role: storage.acl.OWNER_ROLE,
-          },
-          (err, accessControl) => {
-            assert.ifError(err);
-            assert.strictEqual(accessControl!.role, storage.acl.OWNER_ROLE);
-
-            file.acl.update(
-              {
-                entity: USER_ACCOUNT,
-                role: storage.acl.READER_ROLE,
-              },
-              (err, accessControl) => {
-                assert.ifError(err);
-
-                assert.strictEqual(
-                  accessControl!.role,
-                  storage.acl.READER_ROLE
-                );
-
-                file.acl.delete({entity: USER_ACCOUNT}, done);
-              }
-            );
-          }
-        );
-      });
-
-      it('should make a file public', done => {
-        file.makePublic(err => {
-          assert.ifError(err);
-          file.acl.get({entity: 'allUsers'}, (err, aclObject) => {
-            assert.ifError(err);
-            assert.deepStrictEqual(aclObject, {
-              entity: 'allUsers',
-              role: 'READER',
-            });
-            file.acl.delete({entity: 'allUsers'}, done);
-          });
-        });
-      });
-
-      it('should make a file private', done => {
-        file.makePublic(err => {
-          assert.ifError(err);
-          file.makePrivate(err => {
-            assert.ifError(err);
-            file.acl.get(
-              {entity: 'allUsers'},
-              (err: ApiError | null, aclObject) => {
-                assert.strictEqual(err!.code, 404);
-                assert.strictEqual(err!.errors![0].reason, 'notFound');
-                assert.strictEqual(aclObject, null);
-                done();
-              }
-            );
-          });
-        });
-      });
-
-      it('should set custom encryption during the upload', done => {
+      it('should set custom encryption during the upload', async () => {
         const key = '12345678901234567890123456789012';
-        bucket.upload(
-          FILES.big.path,
-          {
-            encryptionKey: key,
-            resumable: false,
-          },
-          (err, file) => {
-            assert.ifError(err);
-
-            file!.getMetadata((err: ApiError | null, metadata: Metadata) => {
-              assert.ifError(err);
-              assert.strictEqual(
-                metadata.customerEncryption.encryptionAlgorithm,
-                'AES256'
-              );
-              done();
-            });
-          }
-        );
+        const [file] = await bucket.upload(FILES.big.path, {
+          encryptionKey: key,
+          resumable: false,
+        });
+        const [metadata] = await file.getMetadata();
+        const encyrptionAlgorithm =
+          metadata.customerEncryption?.encryptionAlgorithm;
+        assert.strictEqual(encyrptionAlgorithm, 'AES256');
       });
 
-      it('should set custom encryption in a resumable upload', done => {
+      it('should set custom encryption in a resumable upload', async () => {
         const key = crypto.randomBytes(32);
-
-        bucket.upload(
-          FILES.big.path,
-          {
-            encryptionKey: key,
-            resumable: true,
-          },
-          (err, file) => {
-            assert.ifError(err);
-
-            file!.getMetadata((err: ApiError | null, metadata: Metadata) => {
-              assert.ifError(err);
-              assert.strictEqual(
-                metadata.customerEncryption.encryptionAlgorithm,
-                'AES256'
-              );
-              done();
-            });
-          }
-        );
+        const [file] = await bucket.upload(FILES.big.path, {
+          encryptionKey: key,
+          resumable: true,
+        });
+        const [metadata] = await file.getMetadata();
+        const encyrptionAlgorithm =
+          metadata.customerEncryption?.encryptionAlgorithm;
+        assert.strictEqual(encyrptionAlgorithm, 'AES256');
       });
 
-      it('should make a file public during the upload', done => {
-        bucket.upload(
-          FILES.big.path,
-          {
-            resumable: false,
-            public: true,
-          },
-          (err, file) => {
-            assert.ifError(err);
+      it('should make a file public during the upload', async () => {
+        const [file] = await bucket.upload(FILES.big.path, {
+          resumable: false,
+          public: true,
+        });
 
-            file!.acl.get({entity: 'allUsers'}, (err, aclObject) => {
-              assert.ifError(err);
-              assert.deepStrictEqual(aclObject, {
-                entity: 'allUsers',
-                role: 'READER',
-              });
-              done();
-            });
-          }
-        );
+        const [aclObject] = await file.acl.get({entity: 'allUsers'});
+        assert.deepStrictEqual(aclObject, {
+          entity: 'allUsers',
+          role: 'READER',
+        });
       });
 
-      it('should make a file public from a resumable upload', done => {
-        bucket.upload(
-          FILES.big.path,
-          {
-            resumable: true,
-            public: true,
-          },
-          (err, file) => {
-            assert.ifError(err);
-
-            file!.acl.get({entity: 'allUsers'}, (err, aclObject) => {
-              assert.ifError(err);
-              assert.deepStrictEqual(aclObject, {
-                entity: 'allUsers',
-                role: 'READER',
-              });
-              done();
-            });
-          }
-        );
+      it('should make a file public from a resumable upload', async () => {
+        const [file] = await bucket.upload(FILES.big.path, {
+          resumable: true,
+          public: true,
+        });
+        const [aclObject] = await file.acl.get({entity: 'allUsers'});
+        assert.deepStrictEqual(aclObject, {
+          entity: 'allUsers',
+          role: 'READER',
+        });
       });
 
-      it('should make a file private from a resumable upload', done => {
-        bucket.upload(
-          FILES.big.path,
-          {
+      it('should make a file private from a resumable upload', async () => {
+        const validateMakeFilePrivateRejects = (err: ApiError) => {
+          assert.strictEqual((err as ApiError)!.code, 404);
+          assert.strictEqual((err as ApiError).errors![0].reason, 'notFound');
+          return true;
+        };
+        assert.doesNotReject(
+          bucket.upload(FILES.big.path, {
             resumable: true,
             private: true,
-          },
-          (err, file) => {
-            assert.ifError(err);
-
-            file!.acl.get({entity: 'allUsers'}, (err, aclObject) => {
-              assert.strictEqual((err as ApiError)!.code, 404);
-              assert.strictEqual(
-                (err as ApiError).errors![0].reason,
-                'notFound'
-              );
-              assert.strictEqual(aclObject, null);
-              done();
-            });
-          }
+          })
+        );
+        assert.rejects(
+          file.acl.get({entity: 'allUsers'}),
+          validateMakeFilePrivateRejects
         );
       });
     });
@@ -672,15 +500,8 @@ describe('storage', () => {
   describe('iam', () => {
     let PROJECT_ID: string;
 
-    before(done => {
-      storage.authClient.getProjectId((err, projectId) => {
-        if (err) {
-          done(err);
-          return;
-        }
-        PROJECT_ID = projectId!;
-        done();
-      });
+    before(async () => {
+      PROJECT_ID = await storage.authClient.getProjectId();
     });
 
     describe('buckets', () => {
@@ -691,49 +512,36 @@ describe('storage', () => {
         return bucket.create();
       });
 
-      it('should get a policy', done => {
-        bucket.iam.getPolicy((err, policy) => {
-          assert.ifError(err);
-          assert.deepStrictEqual(policy!.bindings, [
-            {
-              members: [
-                'projectEditor:' + PROJECT_ID,
-                'projectOwner:' + PROJECT_ID,
-              ],
-              role: 'roles/storage.legacyBucketOwner',
-            },
-            {
-              members: ['projectViewer:' + PROJECT_ID],
-              role: 'roles/storage.legacyBucketReader',
-            },
-          ]);
-
-          done();
-        });
+      it('should get a policy', async () => {
+        const [policy] = await bucket.iam.getPolicy();
+        assert.deepStrictEqual(policy!.bindings, [
+          {
+            members: [
+              'projectEditor:' + PROJECT_ID,
+              'projectOwner:' + PROJECT_ID,
+            ],
+            role: 'roles/storage.legacyBucketOwner',
+          },
+          {
+            members: ['projectViewer:' + PROJECT_ID],
+            role: 'roles/storage.legacyBucketReader',
+          },
+        ]);
       });
 
-      it('should set a policy', done => {
-        bucket.iam.getPolicy((err, policy) => {
-          assert.ifError(err);
-          policy!.bindings.push({
-            role: 'roles/storage.legacyBucketReader',
-            members: ['allUsers'],
-          });
-
-          bucket.iam.setPolicy(policy!, (err, newPolicy) => {
-            assert.ifError(err);
-
-            const legacyBucketReaderBinding = newPolicy!.bindings.filter(
-              binding => {
-                return binding.role === 'roles/storage.legacyBucketReader';
-              }
-            )[0];
-
-            assert(legacyBucketReaderBinding.members.includes('allUsers'));
-
-            done();
-          });
+      it('should set a policy', async () => {
+        const [policy] = await bucket.iam.getPolicy();
+        policy!.bindings.push({
+          role: 'roles/storage.legacyBucketReader',
+          members: ['allUsers'],
         });
+        const [newPolicy] = await bucket.iam.setPolicy(policy);
+        const legacyBucketReaderBinding = newPolicy!.bindings.filter(
+          binding => {
+            return binding.role === 'roles/storage.legacyBucketReader';
+          }
+        )[0];
+        assert(legacyBucketReaderBinding.members.includes('allUsers'));
       });
 
       it('should get-modify-set a conditional policy', async () => {
@@ -771,21 +579,15 @@ describe('storage', () => {
         assert.deepStrictEqual(newPolicy.bindings, policy.bindings);
       });
 
-      it('should test the iam permissions', done => {
+      it('should test the iam permissions', async () => {
         const testPermissions = [
           'storage.buckets.get',
           'storage.buckets.getIamPolicy',
         ];
-
-        bucket.iam.testPermissions(testPermissions, (err, permissions) => {
-          assert.ifError(err);
-
-          assert.deepStrictEqual(permissions, {
-            'storage.buckets.get': true,
-            'storage.buckets.getIamPolicy': true,
-          });
-
-          done();
+        const [permissions] = await bucket.iam.testPermissions(testPermissions);
+        assert.deepStrictEqual(permissions, {
+          'storage.buckets.get': true,
+          'storage.buckets.getIamPolicy': true,
         });
       });
     });
@@ -836,7 +638,7 @@ describe('storage', () => {
       );
       const [bucketMetadata] = await bucket.getMetadata();
       const publicAccessPreventionStatus =
-        bucketMetadata.iamConfiguration.publicAccessPrevention;
+        bucketMetadata!.iamConfiguration!.publicAccessPrevention;
       return assert.strictEqual(
         publicAccessPreventionStatus,
         PUBLIC_ACCESS_PREVENTION_ENFORCED
@@ -885,7 +687,7 @@ describe('storage', () => {
       );
       const [bucketMetadata] = await bucket.getMetadata();
       const publicAccessPreventionStatus =
-        bucketMetadata.iamConfiguration.publicAccessPrevention;
+        bucketMetadata!.iamConfiguration!.publicAccessPrevention;
       return assert.strictEqual(
         publicAccessPreventionStatus,
         PUBLIC_ACCESS_PREVENTION_INHERITED
@@ -910,7 +712,7 @@ describe('storage', () => {
     it('UBLA modification on PAP bucket does not affect pap setting', async () => {
       const [bucketMetadata] = await bucket.getMetadata();
       const publicAccessPreventionStatus =
-        bucketMetadata.iamConfiguration.publicAccessPrevention;
+        bucketMetadata!.iamConfiguration!.publicAccessPrevention;
       await bucket.setMetadata({
         iamConfiguration: {
           uniformBucketLevelAccess: {
@@ -920,7 +722,7 @@ describe('storage', () => {
       });
       const [updatedBucketMetadata] = await bucket.getMetadata();
       return assert.strictEqual(
-        updatedBucketMetadata.iamConfiguration.publicAccessPrevention,
+        updatedBucketMetadata!.iamConfiguration!.publicAccessPrevention,
         publicAccessPreventionStatus
       );
     });
@@ -935,16 +737,303 @@ describe('storage', () => {
       });
       const [bucketMetadata] = await bucket.getMetadata();
       const ublaSetting =
-        bucketMetadata.iamConfiguration.uniformBucketLevelAccess.enabled;
+        bucketMetadata!.iamConfiguration!.uniformBucketLevelAccess!.enabled;
       await setPublicAccessPrevention(
         bucket,
         PUBLIC_ACCESS_PREVENTION_INHERITED
       );
       const [updatedBucketMetadata] = await bucket.getMetadata();
       return assert.strictEqual(
-        updatedBucketMetadata.iamConfiguration.uniformBucketLevelAccess.enabled,
+        updatedBucketMetadata!.iamConfiguration!.uniformBucketLevelAccess!
+          .enabled,
         ublaSetting
       );
+    });
+  });
+
+  describe('turbo replication', () => {
+    let bucket: Bucket;
+
+    const RPO_ASYNC_TURBO = 'ASYNC_TURBO';
+    const RPO_DEFAULT = 'DEFAULT';
+
+    const createBucket = () => {
+      bucket = storage.bucket(generateName());
+      return bucket.create({location: 'NAM4'});
+    };
+
+    const setTurboReplication = (
+      bucket: Bucket,
+      turboReplicationConfiguration: string
+    ) => {
+      return bucket.setMetadata({
+        rpo: turboReplicationConfiguration,
+      });
+    };
+
+    beforeEach(createBucket);
+
+    afterEach(async () => {
+      await bucket.delete();
+    });
+
+    it("sets bucket's RPO to ASYNC_TURBO", async () => {
+      await setTurboReplication(bucket, RPO_ASYNC_TURBO);
+      const [bucketMetadata] = await bucket.getMetadata();
+      return assert.strictEqual(bucketMetadata.rpo, RPO_ASYNC_TURBO);
+    });
+
+    it("sets a bucket's RPO to DEFAULT", async () => {
+      await setTurboReplication(bucket, RPO_DEFAULT);
+      const [bucketMetadata] = await bucket.getMetadata();
+      return assert.strictEqual(bucketMetadata.rpo, RPO_DEFAULT);
+    });
+  });
+
+  describe('soft-delete', () => {
+    describe('buckets', () => {
+      let bucket: Bucket;
+      const SOFT_DELETE_RETENTION_SECONDS = 7 * 24 * 60 * 60; //7 days in seconds;
+      let generation: string;
+
+      before(async () => {
+        bucket = storage.bucket(generateName());
+        await bucket.create();
+        await bucket.setMetadata({
+          softDeletePolicy: {
+            retentionDurationSeconds: SOFT_DELETE_RETENTION_SECONDS,
+          },
+        });
+
+        const [metadata] = await bucket.getMetadata();
+        generation = metadata!.generation!;
+        await bucket.delete();
+      });
+
+      after(async () => {
+        await bucket.delete();
+      });
+
+      it('should be listing soft-deleted buckets', async () => {
+        const [buckets] = await storage.getBuckets({softDeleted: true});
+        assert(buckets.length > 0);
+
+        buckets.forEach(bucket => {
+          assert(bucket.name);
+          assert(bucket.metadata.generation);
+          assert(bucket.metadata.softDeleteTime);
+          assert(bucket.metadata.hardDeleteTime);
+        });
+      });
+
+      it('should GET a soft-deleted bucket', async () => {
+        const [softDeletedBucket] = await storage
+          .bucket(bucket.name)
+          .getMetadata({
+            softDeleted: true,
+            generation: generation,
+          });
+        assert(softDeletedBucket);
+        assert.strictEqual(softDeletedBucket.generation, generation);
+        assert(softDeletedBucket.softDeleteTime);
+        assert(softDeletedBucket.hardDeleteTime);
+      });
+
+      it('should restore a soft-deleted bucket', async () => {
+        const restoredBucket = await storage.bucket(bucket.name).restore({
+          generation: generation,
+        });
+        assert(restoredBucket);
+        const [metadata] = await bucket.getMetadata();
+        assert(metadata);
+      });
+    });
+
+    describe('files', () => {
+      let bucket: Bucket;
+      let hnsBucket: Bucket;
+      const SOFT_DELETE_RETENTION_SECONDS = 7 * 24 * 60 * 60; //7 days in seconds;
+
+      beforeEach(async () => {
+        bucket = storage.bucket(generateName());
+        await bucket.create();
+        await bucket.setMetadata({
+          softDeletePolicy: {
+            retentionDurationSeconds: SOFT_DELETE_RETENTION_SECONDS,
+          },
+        });
+
+        hnsBucket = storage.bucket(generateName());
+        await storage.createBucket(hnsBucket.name, {
+          hierarchicalNamespace: {enabled: true},
+          iamConfiguration: {
+            uniformBucketLevelAccess: {
+              enabled: true,
+            },
+          },
+          softDeletePolicy: {
+            retentionDurationSeconds: SOFT_DELETE_RETENTION_SECONDS,
+          },
+        });
+      });
+
+      afterEach(async () => {
+        await bucket.deleteFiles({force: true, versions: true});
+        await bucket.delete();
+        await hnsBucket.deleteFiles({force: true, versions: true});
+        await hnsBucket.delete();
+      });
+
+      it('should set softDeletePolicy correctly', async () => {
+        const metadata = await bucket.getMetadata();
+        assert(metadata[0].softDeletePolicy);
+        assert(metadata[0].softDeletePolicy.effectiveTime);
+        assert.deepStrictEqual(
+          metadata[0].softDeletePolicy.retentionDurationSeconds,
+          SOFT_DELETE_RETENTION_SECONDS.toString()
+        );
+      });
+
+      it('should LIST soft-deleted files', async () => {
+        const f1 = bucket.file('file1');
+        const f2 = bucket.file('file2');
+        await f1.save('file1');
+        await f2.save('file2');
+        await f1.delete();
+        await f2.delete();
+        const [notSoftDeletedFiles] = await bucket.getFiles();
+        assert.strictEqual(notSoftDeletedFiles.length, 0);
+        const [softDeletedFiles] = await bucket.getFiles({softDeleted: true});
+        assert.strictEqual(softDeletedFiles.length, 2);
+      });
+
+      it('should GET a soft-deleted file', async () => {
+        const f1 = bucket.file('file3');
+        await f1.save('file3');
+        const [metadata] = await f1.getMetadata();
+        await f1.delete();
+        const [softDeletedFile] = await f1.get({
+          softDeleted: true,
+          generation: parseInt(metadata.generation?.toString() || '0'),
+        });
+        assert(softDeletedFile);
+        assert.strictEqual(
+          softDeletedFile.metadata.generation,
+          metadata.generation
+        );
+      });
+
+      it('should restore a soft-deleted file', async () => {
+        const f1 = bucket.file('file4');
+        await f1.save('file4');
+        const [metadata] = await f1.getMetadata();
+        await f1.delete();
+        let [files] = await bucket.getFiles();
+        assert.strictEqual(files.length, 0);
+        const restoredFile = await f1.restore({
+          generation: parseInt(metadata.generation?.toString() || '0'),
+        });
+        assert(restoredFile);
+        [files] = await bucket.getFiles();
+        assert.strictEqual(files.length, 1);
+      });
+
+      it('should LIST soft-deleted files with restore token', async () => {
+        const f1 = hnsBucket.file('file5a');
+        const f2 = hnsBucket.file('file5b');
+        await f1.save('file5a');
+        await f2.save('file5b');
+        await f1.delete();
+        await f2.delete();
+        const [notSoftDeletedFiles] = await hnsBucket.getFiles();
+        assert.strictEqual(notSoftDeletedFiles.length, 0);
+        const [softDeletedFiles] = await hnsBucket.getFiles({
+          softDeleted: true,
+        });
+        assert.strictEqual(softDeletedFiles.length, 2);
+        assert.notStrictEqual(
+          softDeletedFiles![0].metadata.restoreToken,
+          undefined
+        );
+      });
+
+      it('should GET a soft-deleted file with restore token', async () => {
+        const f1 = hnsBucket.file('file6');
+        await f1.save('file6');
+        const [metadata] = await f1.getMetadata();
+        await f1.delete();
+        const [softDeletedFile] = await f1.get({
+          softDeleted: true,
+          generation: parseInt(metadata.generation?.toString() || '0'),
+        });
+        assert(softDeletedFile);
+        assert.strictEqual(
+          softDeletedFile.metadata.generation,
+          metadata.generation
+        );
+        assert.notStrictEqual(softDeletedFile.metadata.restoreToken, undefined);
+      });
+
+      it('should restore a soft-deleted file using restoreToken', async () => {
+        const f1 = hnsBucket.file('file7');
+        await f1.save('file7');
+        const [metadata] = await f1.getMetadata();
+        await f1.delete();
+        let [files] = await hnsBucket.getFiles();
+        assert.strictEqual(files.length, 0);
+        const [softDeletedFile] = await f1.get({
+          softDeleted: true,
+          generation: parseInt(metadata.generation?.toString() || '0'),
+        });
+        assert(softDeletedFile);
+        const restoredFile = await f1.restore({
+          generation: parseInt(
+            softDeletedFile.metadata.generation?.toString() || '0'
+          ),
+          restoreToken: softDeletedFile.metadata.restoreToken,
+        });
+        assert(restoredFile);
+        [files] = await hnsBucket.getFiles();
+        assert.strictEqual(files.length, 1);
+      });
+    });
+  });
+
+  describe('dual-region', () => {
+    let bucket: Bucket;
+
+    const LOCATION = 'US';
+    const REGION1 = 'US-EAST1';
+    const REGION2 = 'US-WEST1';
+
+    beforeEach(() => {
+      bucket = storage.bucket(generateName());
+    });
+
+    it('creates a dual-region bucket', async () => {
+      await bucket.create({
+        location: LOCATION,
+        customPlacementConfig: {
+          dataLocations: [REGION1, REGION2],
+        },
+      });
+
+      const [exists] = await bucket.exists();
+      assert.strictEqual(exists, true);
+
+      const [bucketMetadata] = await bucket.getMetadata();
+
+      assert.strictEqual(bucketMetadata.location, LOCATION);
+
+      assert(bucketMetadata.customPlacementConfig);
+      assert(Array.isArray(bucketMetadata.customPlacementConfig.dataLocations));
+
+      const dataLocations = bucketMetadata.customPlacementConfig.dataLocations;
+
+      assert(dataLocations.includes(REGION1));
+      assert(dataLocations.includes(REGION2));
+
+      assert.strictEqual(bucketMetadata.locationType, 'dual-region');
     });
   });
 
@@ -961,21 +1050,22 @@ describe('storage', () => {
       return bucket.create();
     };
 
-    const setUniformBucketLevelAccess = (bucket: Bucket, enabled: boolean) =>
-      bucket.setMetadata({
+    const setUniformBucketLevelAccess = (bucket: Bucket, enabled: boolean) => {
+      return bucket.setMetadata({
         iamConfiguration: {
           uniformBucketLevelAccess: {
             enabled,
           },
         },
       });
+    };
 
     describe('files', () => {
       before(createBucket);
 
       it('can be written to the bucket by project owner w/o configuration', async () => {
         await setUniformBucketLevelAccess(bucket, true);
-        const file = bucket.file('file');
+        const file = bucket.file(`file-${uuid.v4()}`);
         return assert.doesNotReject(() => file.save('data'));
       });
     });
@@ -992,23 +1082,39 @@ describe('storage', () => {
         await createBucket();
         await setUniformBucketLevelAccess(bucket, true);
 
-        file = bucket.file('file');
-        await file.save('data');
+        file = bucket.file(`file-${uuid.v4()}`);
+        await file.save('data', {resumable: false});
       });
 
-      it('should fail to get file ACL', () => {
-        return assert.rejects(
-          () => file.acl.get(),
-          validateUniformBucketLevelAccessEnabledError
-        );
-      });
+      it('should fail to get file ACL', async () => {
+        // Setting uniform bucket level access is eventually consistent and may take up to a minute to be reflected
+        for (;;) {
+          try {
+            await file.acl.get();
+            await new Promise(res => setTimeout(res, UNIFORM_ACCESS_WAIT_TIME));
+          } catch (err) {
+            assert(
+              validateUniformBucketLevelAccessEnabledError(err as ApiError)
+            );
+            break;
+          }
+        }
+      }).timeout(UNIFORM_ACCESS_TIMEOUT);
 
-      it('should fail to update file ACL', () => {
-        return assert.rejects(
-          () => file.acl.update(customAcl),
-          validateUniformBucketLevelAccessEnabledError
-        );
-      });
+      it('should fail to update file ACL', async () => {
+        // Setting uniform bucket level access is eventually consistent and may take up to a minute to be reflected
+        for (;;) {
+          try {
+            await file.acl.update(customAcl);
+            await new Promise(res => setTimeout(res, UNIFORM_ACCESS_WAIT_TIME));
+          } catch (err) {
+            assert(
+              validateUniformBucketLevelAccessEnabledError(err as ApiError)
+            );
+            break;
+          }
+        }
+      }).timeout(UNIFORM_ACCESS_TIMEOUT);
     });
 
     describe('preserves bucket/file ACL over uniform bucket-level access on/off', () => {
@@ -1021,13 +1127,21 @@ describe('storage', () => {
         await setUniformBucketLevelAccess(bucket, true);
         await setUniformBucketLevelAccess(bucket, false);
 
-        const [aclAfter] = await bucket.acl.default.get();
-        assert.deepStrictEqual(aclAfter, aclBefore);
-      });
+        // Setting uniform bucket level access is eventually consistent and may take up to a minute to be reflected
+        for (;;) {
+          try {
+            const [aclAfter] = await bucket.acl.default.get();
+            assert.deepStrictEqual(aclAfter, aclBefore);
+            break;
+          } catch {
+            await new Promise(res => setTimeout(res, UNIFORM_ACCESS_WAIT_TIME));
+          }
+        }
+      }).timeout(UNIFORM_ACCESS_TIMEOUT);
 
       it('should preserve file ACL', async () => {
-        const file = bucket.file('file');
-        await file.save('data');
+        const file = bucket.file(`file-${uuid.v4()}`);
+        await file.save('data', {resumable: false});
 
         await file.acl.update(customAcl);
         const [aclBefore] = await file.acl.get();
@@ -1035,9 +1149,17 @@ describe('storage', () => {
         await setUniformBucketLevelAccess(bucket, true);
         await setUniformBucketLevelAccess(bucket, false);
 
-        const [aclAfter] = await file.acl.get();
-        assert.deepStrictEqual(aclAfter, aclBefore);
-      });
+        // Setting uniform bucket level access is eventually consistent and may take up to a minute to be reflected
+        for (;;) {
+          try {
+            const [aclAfter] = await file.acl.get();
+            assert.deepStrictEqual(aclAfter, aclBefore);
+            break;
+          } catch {
+            await new Promise(res => setTimeout(res, UNIFORM_ACCESS_WAIT_TIME));
+          }
+        }
+      }).timeout(UNIFORM_ACCESS_TIMEOUT);
     });
   });
 
@@ -1108,15 +1230,12 @@ describe('storage', () => {
       );
     });
 
-    it('should get buckets', done => {
-      storage.getBuckets((err, buckets) => {
-        const createdBuckets = buckets.filter(bucket => {
-          return bucketsToCreate.indexOf(bucket.name) > -1;
-        });
-
-        assert.strictEqual(createdBuckets.length, bucketsToCreate.length);
-        done();
+    it('should get buckets', async () => {
+      const [buckets] = await storage.getBuckets();
+      const createdBuckets = buckets.filter(bucket => {
+        return bucketsToCreate.indexOf(bucket.name) > -1;
       });
+      assert.strictEqual(createdBuckets.length, bucketsToCreate.length);
     });
 
     it('should get buckets as a stream', done => {
@@ -1136,19 +1255,15 @@ describe('storage', () => {
   });
 
   describe('bucket metadata', () => {
-    it('should allow setting metadata on a bucket', done => {
+    it('should allow setting metadata on a bucket', async () => {
       const metadata = {
         website: {
           mainPageSuffix: 'http://fakeuri',
           notFoundPage: 'http://fakeuri/404.html',
         },
       };
-
-      bucket.setMetadata(metadata, (err: ApiError | null, meta: Metadata) => {
-        assert.ifError(err);
-        assert.deepStrictEqual(meta.website, metadata.website);
-        done();
-      });
+      const [meta] = await bucket.setMetadata(metadata);
+      assert.deepStrictEqual(meta.website, metadata.website);
     });
 
     it('should allow changing the storage class', async () => {
@@ -1161,21 +1276,42 @@ describe('storage', () => {
       assert.strictEqual(metadata.storageClass, 'COLDLINE');
     });
 
+    it('should allow enabling & disabling autoclass', async () => {
+      const [bucket] = await storage.createBucket(generateName(), {
+        autoclass: {
+          enabled: true,
+          terminalStorageClass: 'ARCHIVE',
+        },
+      });
+      let [metadata] = await bucket.getMetadata();
+      const timestampEnabled = metadata!.autoclass!.toggleTime;
+      assert.strictEqual(metadata!.autoclass!.enabled, true);
+      assert.strictEqual(metadata!.autoclass?.terminalStorageClass, 'ARCHIVE');
+      [metadata] = await bucket.setMetadata({
+        autoclass: {
+          enabled: false,
+        },
+      });
+      const timestampDisabled = metadata!.autoclass!.toggleTime;
+      assert.strictEqual(metadata!.autoclass!.enabled, false);
+      assert.strictEqual(timestampDisabled! > timestampEnabled!, true);
+    });
+
     describe('locationType', () => {
       const types = ['multi-region', 'region', 'dual-region'];
 
       beforeEach(() => {
-        delete bucket.metadata;
+        bucket.metadata = {};
       });
 
       it('should be available from getting a bucket', async () => {
         const [metadata] = await bucket.getMetadata();
-        assert(types.includes(metadata.locationType));
+        assert(types.includes(metadata.locationType!));
       });
 
       it('should be available from creating a bucket', async () => {
         const [bucket] = await storage.createBucket(generateName());
-        assert(types.includes(bucket.metadata.locationType));
+        assert(types.includes(bucket.metadata.locationType!));
         return bucket.delete();
       });
 
@@ -1185,19 +1321,19 @@ describe('storage', () => {
         assert(buckets.length > 0);
 
         buckets.forEach(bucket => {
-          assert(types.includes(bucket.metadata.locationType));
+          assert(types.includes(bucket.metadata.locationType!));
         });
       });
 
       it('should be available from setting retention policy', async () => {
         await bucket.setRetentionPeriod(RETENTION_DURATION_SECONDS);
-        assert(types.includes(bucket.metadata.locationType));
+        assert(types.includes(bucket.metadata.locationType!));
         await bucket.removeRetentionPeriod();
       });
 
       it('should be available from updating a bucket', async () => {
-        await bucket.setLabels({a: 'b'});
-        assert(types.includes(bucket.metadata.locationType));
+        await bucket.setMetadata({labels: {a: 'b'}});
+        assert(types.includes(bucket.metadata.locationType!));
       });
     });
 
@@ -1207,177 +1343,192 @@ describe('storage', () => {
         labeltwo: 'labelvaluetwo',
       };
 
-      beforeEach(done => {
-        bucket.deleteLabels(done);
+      beforeEach(async () => {
+        const [metadata] = await bucket.getMetadata();
+        const labels: {[index: string]: string | null} = {};
+        if (metadata.labels) {
+          for (const curLabel of Object.keys(metadata.labels)) {
+            labels[curLabel] = null;
+          }
+          await bucket.setMetadata({labels});
+        }
       });
 
-      it('should set labels', done => {
-        bucket.setLabels(LABELS, err => {
-          assert.ifError(err);
-
-          bucket.getLabels((err, labels) => {
-            assert.ifError(err);
-            assert.deepStrictEqual(labels, LABELS);
-            done();
-          });
-        });
+      it('should set labels', async () => {
+        await bucket.setMetadata({labels: LABELS});
+        const [metadata] = await bucket.getMetadata();
+        assert.deepStrictEqual(metadata.labels, LABELS);
       });
 
-      it('should update labels', done => {
+      it('should update labels', async () => {
         const newLabels = {
           siblinglabel: 'labelvalue',
         };
-
-        bucket.setLabels(LABELS, err => {
-          assert.ifError(err);
-
-          bucket.setLabels(newLabels, err => {
-            assert.ifError(err);
-
-            bucket.getLabels((err, labels) => {
-              assert.ifError(err);
-              assert.deepStrictEqual(
-                labels,
-                Object.assign({}, LABELS, newLabels)
-              );
-              done();
-            });
-          });
-        });
+        await bucket.setMetadata({labels: LABELS});
+        await bucket.setMetadata({labels: newLabels});
+        const [metadata] = await bucket.getMetadata();
+        assert.deepStrictEqual(
+          metadata.labels,
+          Object.assign({}, LABELS, newLabels)
+        );
       });
 
-      it('should delete a single label', done => {
+      it('should delete a single label', async () => {
         if (Object.keys(LABELS).length <= 1) {
-          done(new Error('Maintainer Error: `LABELS` needs 2 labels.'));
-          return;
+          throw new Error('Maintainer Error: `LABELS` needs 2 labels.');
         }
 
         const labelKeyToDelete = Object.keys(LABELS)[0];
+        await bucket.setMetadata({labels: LABELS});
+        const labelsToDelete = {
+          [labelKeyToDelete]: null,
+        };
+        await bucket.setMetadata({labels: labelsToDelete});
+        const [metadata] = await bucket.getMetadata();
+        const expectedLabels = Object.assign({}, LABELS);
+        delete (expectedLabels as {[index: string]: {}})[labelKeyToDelete];
 
-        bucket.setLabels(LABELS, err => {
-          assert.ifError(err);
-
-          bucket.deleteLabels(labelKeyToDelete, err => {
-            assert.ifError(err);
-
-            bucket.getLabels((err, labels) => {
-              assert.ifError(err);
-
-              const expectedLabels = Object.assign({}, LABELS);
-              delete (expectedLabels as {[index: string]: {}})[
-                labelKeyToDelete
-              ];
-
-              assert.deepStrictEqual(labels, expectedLabels);
-
-              done();
-            });
-          });
-        });
+        assert.deepStrictEqual(metadata.labels, expectedLabels);
       });
 
-      it('should delete all labels', done => {
-        bucket.deleteLabels(err => {
-          assert.ifError(err);
-
-          bucket.getLabels((err, labels) => {
-            assert.ifError(err);
-            assert.deepStrictEqual(labels, {});
-            done();
-          });
-        });
+      it('should delete all labels', async () => {
+        let [metadata] = await bucket.getMetadata();
+        if (metadata.labels) {
+          const labels: {[index: string]: string | null} = {};
+          for (const curLabel of Object.keys(metadata.labels)) {
+            labels[curLabel] = null;
+          }
+          await bucket.setMetadata({labels});
+        }
+        [metadata] = await bucket.getMetadata();
+        assert.deepStrictEqual(metadata.labels, undefined);
       });
     });
   });
 
   describe('bucket object lifecycle management', () => {
-    it('should add a rule', done => {
-      bucket.addLifecycleRule(
-        {
-          action: 'delete',
-          condition: {
-            age: 30,
-            isLive: true,
-          },
+    it('should add a rule', async () => {
+      await bucket.addLifecycleRule({
+        action: {
+          type: 'Delete',
         },
-        err => {
-          assert.ifError(err);
+        condition: {
+          age: 30,
+          isLive: true,
+        },
+      });
 
-          const rules = [].slice.call(bucket.metadata.lifecycle.rule);
-
-          assert.deepStrictEqual(rules.pop(), {
-            action: {
-              type: 'Delete',
-            },
-            condition: {
-              age: 30,
-              isLive: true,
-            },
-          });
-
-          done();
-        }
-      );
+      const rules = [].slice.call(bucket.metadata.lifecycle?.rule);
+      assert.deepStrictEqual(rules.pop(), {
+        action: {
+          type: 'Delete',
+        },
+        condition: {
+          age: 30,
+          isLive: true,
+        },
+      });
     });
 
     it('should append a new rule', async () => {
       const numExistingRules =
-        (bucket.metadata.lifecycle && bucket.metadata.lifecycle.rule.length) ||
+        (bucket.metadata.lifecycle && bucket.metadata.lifecycle.rule!.length) ||
         0;
 
       await bucket.addLifecycleRule({
-        action: 'delete',
+        action: {
+          type: 'Delete',
+        },
         condition: {
           age: 30,
           isLive: true,
         },
       });
       await bucket.addLifecycleRule({
-        action: 'setStorageClass',
+        action: {
+          type: 'SetStorageClass',
+          storageClass: 'coldline',
+        },
         condition: {
           age: 60,
           isLive: true,
         },
-        storageClass: 'coldline',
       });
       assert.strictEqual(
-        bucket.metadata.lifecycle.rule.length,
+        bucket.metadata.lifecycle!.rule!.length,
         numExistingRules + 2
       );
     });
 
-    it('should convert a rule with createdBefore to a date in string', done => {
-      bucket.addLifecycleRule(
-        {
-          action: 'delete',
-          condition: {
-            createdBefore: new Date('2018'),
-          },
+    it('should add a prefix rule', async () => {
+      await bucket.addLifecycleRule({
+        action: {
+          type: 'Delete',
         },
-        err => {
-          assert.ifError(err);
+        condition: {
+          matchesPrefix: [TESTS_PREFIX],
+        },
+      });
 
-          const rules = [].slice.call(bucket.metadata.lifecycle.rule);
-
-          assert.deepStrictEqual(rules.pop(), {
-            action: {
-              type: 'Delete',
-            },
-            condition: {
-              createdBefore: '2018-01-01',
-            },
-          });
-
-          done();
-        }
+      assert(
+        bucket.metadata.lifecycle!.rule!.some(
+          (rule: LifecycleRule) =>
+            typeof rule.action === 'object' &&
+            rule.action.type === 'Delete' &&
+            typeof rule.condition.matchesPrefix === 'object' &&
+            (rule.condition.matchesPrefix as string[]).length === 1 &&
+            Array.isArray(rule.condition.matchesPrefix)
+        )
       );
+    });
+
+    it('should add a suffix rule', async () => {
+      await bucket.addLifecycleRule({
+        action: {
+          type: 'Delete',
+        },
+        condition: {
+          matchesSuffix: [TESTS_PREFIX, 'test_suffix'],
+        },
+      });
+
+      assert(
+        bucket.metadata.lifecycle!.rule!.some(
+          (rule: LifecycleRule) =>
+            typeof rule.action === 'object' &&
+            rule.action.type === 'Delete' &&
+            Array.isArray(rule.condition.matchesPrefix)
+        )
+      );
+    });
+
+    it('should convert a rule with createdBefore to a date in string', async () => {
+      await bucket.addLifecycleRule({
+        action: {
+          type: 'Delete',
+        },
+        condition: {
+          createdBefore: new Date('2018'),
+        },
+      });
+      const rules = [].slice.call(bucket.metadata.lifecycle?.rule);
+      assert.deepStrictEqual(rules.pop(), {
+        action: {
+          type: 'Delete',
+        },
+        condition: {
+          createdBefore: '2018-01-01',
+        },
+      });
     });
 
     it('should add a noncurrent time rule', async () => {
       const NONCURRENT_TIME_BEFORE = '2020-01-01';
 
       await bucket.addLifecycleRule({
-        action: 'delete',
+        action: {
+          type: 'Delete',
+        },
         condition: {
           noncurrentTimeBefore: new Date(NONCURRENT_TIME_BEFORE),
           daysSinceNoncurrentTime: 100,
@@ -1385,7 +1536,7 @@ describe('storage', () => {
       });
 
       assert(
-        bucket.metadata.lifecycle.rule.some(
+        bucket.metadata.lifecycle!.rule!.some(
           (rule: LifecycleRule) =>
             typeof rule.action === 'object' &&
             rule.action.type === 'Delete' &&
@@ -1399,7 +1550,9 @@ describe('storage', () => {
       const CUSTOM_TIME_BEFORE = '2020-01-01';
 
       await bucket.addLifecycleRule({
-        action: 'delete',
+        action: {
+          type: 'Delete',
+        },
         condition: {
           customTimeBefore: new Date(CUSTOM_TIME_BEFORE),
           daysSinceCustomTime: 100,
@@ -1407,7 +1560,7 @@ describe('storage', () => {
       });
 
       assert(
-        bucket.metadata.lifecycle.rule.some(
+        bucket.metadata.lifecycle!.rule!.some(
           (rule: LifecycleRule) =>
             typeof rule.action === 'object' &&
             rule.action.type === 'Delete' &&
@@ -1417,17 +1570,12 @@ describe('storage', () => {
       );
     });
 
-    it('should remove all existing rules', done => {
-      bucket.setMetadata(
-        {
-          lifecycle: null,
-        },
-        (err: ApiError) => {
-          assert.ifError(err);
-          assert.strictEqual(bucket.metadata.lifecycle, undefined);
-          done();
-        }
-      );
+    it('should remove all existing rules', async () => {
+      await bucket.setMetadata({
+        lifecycle: null,
+      });
+
+      assert.strictEqual(bucket.metadata.lifecycle, undefined);
     });
   });
 
@@ -1487,7 +1635,7 @@ describe('storage', () => {
           },
         });
         await bucket.getMetadata();
-        assert.strictEqual(bucket.metadata.versioning.enabled, true);
+        assert.strictEqual(bucket.metadata!.versioning!.enabled, true);
       });
 
       it('should by default create a bucket without versioning set', async () => {
@@ -1496,6 +1644,54 @@ describe('storage', () => {
         await bucket.getMetadata();
         assert.strictEqual(bucket.metadata.versioning, undefined);
       });
+    });
+  });
+
+  describe('bucket hierarchical namespace', async () => {
+    let bucket: Bucket;
+
+    beforeEach(() => {
+      bucket = storage.bucket(generateName());
+    });
+
+    afterEach(async () => {
+      try {
+        await bucket.delete();
+      } catch {
+        //Ignore errors
+      }
+    });
+
+    it('should create a bucket without hierarchical namespace enabled (implicit)', async () => {
+      await storage.createBucket(bucket.name);
+      const [metadata] = await bucket.getMetadata();
+      assert(
+        [undefined, false].includes(metadata?.hierarchicalNamespace?.enabled)
+      );
+    });
+
+    it('should create a bucket without hierarchical namespace enabled (explicit)', async () => {
+      await storage.createBucket(bucket.name, {
+        hierarchicalNamespace: {enabled: false},
+      });
+      const [metadata] = await bucket.getMetadata();
+      assert(
+        [undefined, false].includes(metadata?.hierarchicalNamespace?.enabled)
+      );
+    });
+
+    it('should create a bucket with hierarchical namespace enabled', async () => {
+      await storage.createBucket(bucket.name, {
+        hierarchicalNamespace: {enabled: true},
+        iamConfiguration: {
+          uniformBucketLevelAccess: {
+            enabled: true,
+          },
+        },
+      });
+      const [metadata] = await bucket.getMetadata();
+      assert(metadata.hierarchicalNamespace);
+      assert.strictEqual(metadata.hierarchicalNamespace.enabled, true);
     });
   });
 
@@ -1510,7 +1706,7 @@ describe('storage', () => {
         });
         await bucket.getMetadata();
         assert.strictEqual(
-          bucket.metadata.retentionPolicy.retentionPeriod,
+          bucket.metadata!.retentionPolicy!.retentionPeriod,
           `${RETENTION_DURATION_SECONDS}`
         );
       });
@@ -1521,7 +1717,7 @@ describe('storage', () => {
         await bucket.setRetentionPeriod(RETENTION_DURATION_SECONDS);
         await bucket.getMetadata();
         assert.strictEqual(
-          bucket.metadata.retentionPolicy.retentionPeriod,
+          bucket.metadata!.retentionPolicy!.retentionPeriod,
           `${RETENTION_DURATION_SECONDS}`
         );
       });
@@ -1532,7 +1728,7 @@ describe('storage', () => {
         await bucket.setRetentionPeriod(RETENTION_DURATION_SECONDS);
         await bucket.getMetadata();
 
-        await bucket.lock(bucket.metadata.metageneration);
+        await bucket.lock(bucket.metadata!.metageneration!.toString());
         await assert.rejects(
           bucket.setRetentionPeriod(RETENTION_DURATION_SECONDS / 2),
           (err: ApiError) => {
@@ -1547,7 +1743,7 @@ describe('storage', () => {
         await bucket.setRetentionPeriod(RETENTION_DURATION_SECONDS);
         await bucket.getMetadata();
         assert.strictEqual(
-          bucket.metadata.retentionPolicy.retentionPeriod,
+          bucket.metadata!.retentionPolicy!.retentionPeriod,
           `${RETENTION_DURATION_SECONDS}`
         );
 
@@ -1562,22 +1758,13 @@ describe('storage', () => {
       const FILE = BUCKET.file(generateName());
 
       const BUCKET_RETENTION_PERIOD = 1;
-      before(done => {
-        BUCKET.create(
-          {
-            retentionPolicy: {
-              retentionPeriod: BUCKET_RETENTION_PERIOD,
-            },
+      before(async () => {
+        await BUCKET.create({
+          retentionPolicy: {
+            retentionPeriod: BUCKET_RETENTION_PERIOD,
           },
-          err => {
-            if (err) {
-              done(err);
-              return;
-            }
-
-            FILE.save('data', done);
-          }
-        );
+        });
+        await FILE.save('data');
       });
 
       afterEach(() => {
@@ -1602,12 +1789,9 @@ describe('storage', () => {
         assert.strictEqual(FILE.metadata.temporaryHold, false);
       });
 
-      it('should get an expiration date', done => {
-        FILE.getExpirationDate((err, expirationDate) => {
-          assert.ifError(err);
-          assert(expirationDate instanceof Date);
-          done();
-        });
+      it('should get an expiration date', async () => {
+        const [expirationDate] = await FILE.getExpirationDate();
+        assert(expirationDate instanceof Date);
       });
     });
 
@@ -1617,66 +1801,43 @@ describe('storage', () => {
 
       const RETENTION_PERIOD_SECONDS = 5; // Each test has this much time!
 
-      function createFile(callback: GetFileCallback) {
+      async function createFile(): Promise<File> {
         const file = BUCKET.file(generateName());
+        await file.save('data');
         FILES.push(file);
-
-        file.save('data', err => {
-          if (err) {
-            callback(err);
-            return;
-          }
-
-          callback(null, file);
-        });
+        return file;
       }
 
-      async function deleteFilesAsync() {
+      before(async () => {
+        await BUCKET.create({
+          retentionPolicy: {
+            retentionPeriod: RETENTION_PERIOD_SECONDS,
+          },
+        });
+      });
+
+      after(async () => {
         await new Promise(resolve =>
           setTimeout(resolve, RETENTION_PERIOD_SECONDS * 1000)
         );
-        return Promise.all(
+        await Promise.all(
           FILES.map(async file => {
-            await file.setMetadata({temporaryHold: null});
             return file.delete();
           })
         );
-      }
-
-      before(done => {
-        BUCKET.create(
-          {
-            retentionPolicy: {
-              retentionPeriod: RETENTION_PERIOD_SECONDS,
-            },
-          },
-          done
-        );
       });
 
-      after(() => {
-        return deleteFilesAsync();
-      });
-
-      it('should block an overwrite request', done => {
-        createFile((err, file) => {
-          assert.ifError(err);
-
-          file!.save('new data', err => {
-            assert.strictEqual((err as ApiError).code, 403);
-            done();
-          });
+      it('should block an overwrite request', async () => {
+        const file = await createFile();
+        assert.rejects(file.save('new data'), (err: ApiError) => {
+          assert.strictEqual(err.code, 403);
         });
       });
 
-      it('should block a delete request', done => {
-        createFile((err, file) => {
-          assert.ifError(err);
-
-          file!.delete((err: ApiError) => {
-            assert.strictEqual(err.code, 403);
-            done();
-          });
+      it('should block a delete request', async () => {
+        const file = await createFile();
+        assert.rejects(file.delete(), (err: ApiError) => {
+          assert.strictEqual(err.code, 403);
         });
       });
     });
@@ -1708,32 +1869,74 @@ describe('storage', () => {
     });
   });
 
+  describe('object retention lock', () => {
+    const fileName = generateName();
+    let objectRetentionBucket: Bucket;
+
+    before(async () => {
+      objectRetentionBucket = storage.bucket(generateName());
+    });
+
+    after(async () => {
+      await objectRetentionBucket.deleteFiles({force: true});
+      await objectRetentionBucket.delete();
+    });
+
+    it('should create a bucket with object retention enabled', async () => {
+      const result = await objectRetentionBucket.create({
+        enableObjectRetention: true,
+      });
+
+      assert.deepStrictEqual(result[0].metadata.objectRetention, {
+        mode: 'Enabled',
+      });
+    });
+
+    it('should create a file with object retention enabled', async () => {
+      const time = new Date();
+      time.setMinutes(time.getMinutes() + 1);
+      const retention = {mode: 'Unlocked', retainUntilTime: time.toISOString()};
+      const file = new File(objectRetentionBucket, fileName);
+      await objectRetentionBucket.upload(FILES.big.path, {
+        metadata: {
+          retention,
+        },
+        destination: fileName,
+      });
+      const [metadata] = await file.getMetadata();
+      assert.deepStrictEqual(metadata.retention, retention);
+    });
+
+    it('should disable object retention on the file', async () => {
+      const file = new File(objectRetentionBucket, fileName);
+      const [metadata] = await file.setMetadata(
+        {retention: null},
+        {overrideUnlockedRetention: true}
+      );
+      assert.strictEqual(metadata.retention, undefined);
+    });
+  });
+
   describe('requester pays', () => {
     const HAS_2ND_PROJECT =
       process.env.GCN_STORAGE_2ND_PROJECT_ID !== undefined;
     let bucket: Bucket;
 
-    before(done => {
+    before(async () => {
       bucket = storage.bucket(generateName());
 
-      bucket.create(
-        {
-          requesterPays: true,
-        },
-        done
-      );
-    });
-
-    after(done => {
-      bucket.delete(done);
-    });
-
-    it('should have enabled requesterPays functionality', done => {
-      bucket.getMetadata((err: ApiError | null, metadata: Metadata) => {
-        assert.ifError(err);
-        assert.strictEqual(metadata.billing.requesterPays, true);
-        done();
+      await bucket.create({
+        requesterPays: true,
       });
+    });
+
+    after(async () => {
+      await bucket.delete();
+    });
+
+    it('should have enabled requesterPays functionality', async () => {
+      const [metadata] = await bucket.getMetadata();
+      assert.strictEqual(metadata.billing!.requesterPays, true);
     });
 
     // These tests will verify that the requesterPays functionality works from
@@ -1744,6 +1947,7 @@ describe('storage', () => {
         keyFilename: process.env.GCN_STORAGE_2ND_PROJECT_KEY,
         retryOptions: {
           idempotencyStrategy: IdempotencyStrategy.RetryAlways,
+          retryDelayMultiplier: 3,
         },
       });
       // the source bucket, which will have requesterPays enabled.
@@ -1751,62 +1955,33 @@ describe('storage', () => {
       // the bucket object from the requesting user.
       let bucketNonAllowList: Bucket;
 
-      function isRequesterPaysEnabled(
-        callback: (err: Error | null, isEnabled?: boolean) => void
-      ) {
-        bucket.getMetadata((err: ApiError | null, metadata: Metadata) => {
-          if (err) {
-            callback(err);
-            return;
-          }
-
-          const billing = metadata.billing || {};
-          callback(null, !!billing && billing.requesterPays === true);
-        });
+      async function isRequesterPaysEnabled(): Promise<boolean> {
+        const [metadata] = await bucket.getMetadata();
+        const billing = metadata.billing || {};
+        return !!billing && billing.requesterPays === true;
       }
 
-      before(done => {
+      before(async () => {
         bucket = storage.bucket(generateName());
         bucketNonAllowList = storageNonAllowList.bucket(bucket.name);
-        bucket.create(done);
+        await bucket.create();
       });
 
-      it('should enable requesterPays', done => {
-        isRequesterPaysEnabled((err, isEnabled) => {
-          assert.ifError(err);
-          assert.strictEqual(isEnabled, false);
-
-          bucket.enableRequesterPays(err => {
-            assert.ifError(err);
-
-            isRequesterPaysEnabled((err, isEnabled) => {
-              assert.ifError(err);
-              assert.strictEqual(isEnabled, true);
-              done();
-            });
-          });
-        });
+      it('should enable requesterPays', async () => {
+        let isEnabled = await isRequesterPaysEnabled();
+        assert.strictEqual(isEnabled, false);
+        await bucket.enableRequesterPays();
+        isEnabled = await isRequesterPaysEnabled();
+        assert.strictEqual(isEnabled, true);
       });
 
-      it('should disable requesterPays', done => {
-        bucket.enableRequesterPays(err => {
-          assert.ifError(err);
-
-          isRequesterPaysEnabled((err, isEnabled) => {
-            assert.ifError(err);
-            assert.strictEqual(isEnabled, true);
-
-            bucket.disableRequesterPays(err => {
-              assert.ifError(err);
-
-              isRequesterPaysEnabled((err, isEnabled) => {
-                assert.ifError(err);
-                assert.strictEqual(isEnabled, false);
-                done();
-              });
-            });
-          });
-        });
+      it('should disable requesterPays', async () => {
+        await bucket.enableRequesterPays();
+        let isEnabled = await isRequesterPaysEnabled();
+        assert.strictEqual(isEnabled, true);
+        await bucket.disableRequesterPays();
+        isEnabled = await isRequesterPaysEnabled();
+        assert.strictEqual(isEnabled, false);
       });
 
       describe('methods that accept userProject', () => {
@@ -1822,38 +1997,31 @@ describe('storage', () => {
         //
         // - file.save()
         //   -> file.createWriteStream()
-        before(() => {
+        before(async () => {
           file = bucketNonAllowList.file(generateName());
 
-          return bucket
-            .enableRequesterPays()
-            .then(() => bucket.iam.getPolicy())
-            .then(data => {
-              const policy = data[0];
-
-              // Allow an absolute or relative path (from project root)
-              // for the key file.
-              let key2 = process.env.GCN_STORAGE_2ND_PROJECT_KEY;
-              if (key2 && key2.charAt(0) === '.') {
-                key2 = `${__dirname}/../../${key2}`;
-              }
-
-              // Get the service account for the "second" account (the
-              // one that will read the requester pays file).
-              const clientEmail = require(key2!).client_email;
-
-              policy.bindings.push({
-                role: 'roles/storage.admin',
-                members: [`serviceAccount:${clientEmail}`],
-              });
-
-              return bucket.iam.setPolicy(policy);
-            })
-            .then(() => file.save('abc', USER_PROJECT_OPTIONS))
-            .then(() => topic.getMetadata())
-            .then(data => {
-              topicName = data[0].name;
-            });
+          await bucket.enableRequesterPays();
+          const data = await bucket.iam.getPolicy();
+          const policy = data[0];
+          // Allow an absolute or relative path (from project root)
+          // for the key file.
+          let key2 = process.env.GCN_STORAGE_2ND_PROJECT_KEY;
+          if (key2 && key2.charAt(0) === '.') {
+            key2 = `${getDirName()}/../../../${key2}`;
+          }
+          // Get the service account for the "second" account (the
+          // one that will read the requester pays file).
+          const clientEmail = JSON.parse(
+            fs.readFileSync(key2!, 'utf-8')
+          ).client_email;
+          policy.bindings.push({
+            role: 'roles/storage.admin',
+            members: [`serviceAccount:${clientEmail}`],
+          });
+          await bucket.iam.setPolicy(policy);
+          await file.save('abc', USER_PROJECT_OPTIONS);
+          const data_2 = await topic.getMetadata();
+          topicName = data_2[0].name!;
         });
 
         // This acts as a test for the following methods:
@@ -1871,16 +2039,46 @@ describe('storage', () => {
           file = bucketNonAllowList.file(file.name);
         });
 
-        function doubleTest(testFunction: Function) {
-          const failureMessage =
-            'Bucket is requester pays bucket but no user project provided.';
+        /**
+         * A type for requester pays functions. The `options` parameter
+         *
+         * Using `typeof USER_PROJECT_OPTIONS` ensures the function should
+         * support requester pays options, otherwise will fail early at build-
+         * time rather than runtime.
+         */
+        type requesterPaysFunction<
+          T = {} | typeof USER_PROJECT_OPTIONS,
+          R = {} | void,
+        > = (options?: T) => Promise<R>;
 
-          return (done: Function) => {
-            testFunction({}, (err: Error) => {
-              assert(err.message.indexOf(failureMessage) > -1);
-              testFunction(USER_PROJECT_OPTIONS, done);
-            });
-          };
+        /**
+         * Accepts a function and runs 2 tests - a test where the requester pays
+         * option is absent and another where it is present:
+         * - The missing requester pays test will assert the expected error
+         * - The added request pays test will return the function's result
+         *
+         * @param testFunction The function/method to test.
+         * @returns The result of the successful request pays operation.
+         */
+        async function requesterPaysDoubleTest<F extends requesterPaysFunction>(
+          testFunction: F
+        ): Promise<ReturnType<F>> {
+          const failureMessage =
+            'Bucket is a requester pays bucket but no user project provided.';
+
+          await assert.rejects(testFunction(), err => {
+            assert(
+              (err as Error).message.includes(failureMessage),
+              `Expected '${
+                (err as Error).message
+              }' to include '${failureMessage}'`
+            );
+            return true;
+          });
+
+          // Validate the desired functionality
+          const results = await testFunction(USER_PROJECT_OPTIONS);
+          return results as ReturnType<F>;
         }
 
         it('bucket#combine', async () => {
@@ -1908,414 +2106,257 @@ describe('storage', () => {
           }
         });
 
-        it(
-          'bucket#createNotification',
-          doubleTest(
-            (
-              options: CreateNotificationOptions,
-              done: ErrorCallbackFunction
-            ) => {
-              bucketNonAllowList.createNotification(
-                topicName,
-                options,
-                (err, _notification) => {
-                  notification = _notification!;
-                  done(err);
-                }
-              );
-            }
-          )
-        );
+        it('bucket#createNotification', async () => {
+          const [notif] = await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.createNotification(topicName, options);
+          });
 
-        it(
-          'bucket#exists',
-          doubleTest(
-            (options: BucketExistsOptions, done: BucketExistsCallback) => {
-              bucketNonAllowList.exists(options, done);
-            }
-          )
-        );
+          notification = notif;
+        });
 
-        it(
-          'bucket#get',
-          doubleTest((options: GetBucketOptions, done: GetBucketCallback) => {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            bucketNonAllowList.get(options, done as any);
-          })
-        );
+        it('bucket#exists', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.exists(options);
+          });
+        });
 
-        it(
-          'bucket#getMetadata',
-          doubleTest((options: GetBucketOptions, done: GetBucketCallback) => {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            bucketNonAllowList.get(options, done as any);
-          })
-        );
+        it('bucket#get', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.get(options);
+          });
+        });
 
-        it(
-          'bucket#getNotifications',
-          doubleTest(
-            (
-              options: GetNotificationOptions,
-              done: GetNotificationsCallback
-            ) => {
-              bucketNonAllowList.getNotifications(options, done);
-            }
-          )
-        );
+        it('bucket#getMetadata', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.getMetadata(options);
+          });
+        });
 
-        it(
-          'bucket#makePrivate',
-          doubleTest(
-            (
-              options: MakeBucketPrivateOptions,
-              done: MakeBucketPrivateCallback
-            ) => {
-              bucketNonAllowList.makePrivate(options, done);
-            }
-          )
-        );
+        it('bucket#getNotifications', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.getNotifications(options);
+          });
+        });
 
-        it(
-          'bucket#setMetadata',
-          doubleTest(
-            (
-              options: SetBucketMetadataOptions,
-              done: SetBucketMetadataCallback
-            ) => {
-              bucketNonAllowList.setMetadata(
-                {newMetadata: true},
-                options,
-                done
-              );
-            }
-          )
-        );
+        it('bucket#makePrivate', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.makePrivate(options);
+          });
+        });
 
-        it(
-          'bucket#setStorageClass',
-          doubleTest(
-            (
-              options: SetStorageClassOptions,
-              done: SetStorageClassCallback
-            ) => {
-              bucketNonAllowList.setStorageClass(
-                'multi-regional',
-                options,
-                done
-              );
-            }
-          )
-        );
+        it('bucket#setMetadata', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.setMetadata({newMetadata: true}, options);
+          });
+        });
 
-        it(
-          'bucket#upload',
-          doubleTest((options: UploadOptions, done: UploadCallback) => {
-            bucketNonAllowList.upload(FILES.big.path, options, done);
-          })
-        );
+        it('bucket#setStorageClass', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.setStorageClass(
+              'multi-regional',
+              options
+            );
+          });
+        });
 
-        it(
-          'file#copy',
-          doubleTest((options: CopyOptions, done: CopyCallback) => {
-            file.copy('new-file.txt', options, done);
-          })
-        );
+        it('bucket#upload', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.upload(FILES.big.path, options);
+          });
+        });
 
-        it(
-          'file#createReadStream',
-          doubleTest(
-            (options: CreateReadStreamOptions, done: (err: Error) => void) => {
-              file
+        it('file#copy', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.copy('new-file.txt', options);
+          });
+        });
+
+        it('file#createReadStream', async () => {
+          await requesterPaysDoubleTest(async options => {
+            await new Promise((resolve, reject) => {
+              return file
                 .createReadStream(options)
-                .on('error', done)
-                .on('end', done)
-                .on('data', util.noop);
-            }
-          )
-        );
-
-        it(
-          'file#createResumableUpload',
-          doubleTest(
-            (
-              options: CreateResumableUploadOptions,
-              done: (err: Error) => void
-            ) => {
-              file.createResumableUpload(options, (err, uri) => {
-                if (err) {
-                  done(err);
-                  return;
-                }
-
-                file
-                  .createWriteStream({uri})
-                  .on('error', done)
-                  .on('finish', done)
-                  .end('Test data');
-              });
-            }
-          )
-        );
-
-        it(
-          'file#download',
-          doubleTest((options: DownloadOptions, done: DownloadCallback) => {
-            file.download(options, done);
-          })
-        );
-
-        it(
-          'file#exists',
-          doubleTest((options: FileExistsOptions, done: FileExistsCallback) => {
-            file.exists(options, done);
-          })
-        );
-
-        it(
-          'file#get',
-          doubleTest((options: GetFileOptions, done: GetFileCallback) => {
-            file.get(options, (err: ApiError | null) => {
-              done(err);
+                .on('error', reject)
+                .on('end', resolve)
+                .on('data', () => {});
             });
-          })
-        );
+          });
+        });
 
-        it(
-          'file#getMetadata',
-          doubleTest(
-            (
-              options: GetFileMetadataOptions,
-              done: GetFileMetadataCallback
-            ) => {
-              file.getMetadata(options, done);
-            }
-          )
-        );
+        it('file#createResumableUpload', async () => {
+          await requesterPaysDoubleTest(async options => {
+            const [uri] = await file.createResumableUpload(options);
 
-        it(
-          'file#makePrivate',
-          doubleTest(
-            (
-              options: MakeFilePrivateOptions,
-              done: MakeFilePrivateCallback
-            ) => {
-              file.makePrivate(options, done);
-            }
-          )
-        );
+            await new Promise((resolve, reject) => {
+              return file
+                .createWriteStream({uri})
+                .on('error', reject)
+                .on('finish', resolve)
+                .end('Test data');
+            });
+          });
+        });
 
-        it(
-          'file#move',
-          doubleTest((options: GetFileOptions, done: SaveCallback) => {
+        it('file#download', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.download(options);
+          });
+        });
+
+        it('file#exists', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.exists(options);
+          });
+        });
+
+        it('file#get', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.get(options);
+          });
+        });
+
+        it('file#getMetadata', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.getMetadata(options);
+          });
+        });
+
+        it('file#makePrivate', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.makePrivate(options);
+          });
+        });
+
+        it('file#move', async () => {
+          await requesterPaysDoubleTest(async options => {
             const newFile = bucketNonAllowList.file(generateName());
 
-            file.move(newFile, options, err => {
-              if (err) {
-                done(err);
-                return;
-              }
+            await file.move(newFile, options);
 
-              // Re-create the file. The tests need it.
-              file.save('newcontent', options, done);
-            });
-          })
-        );
+            // Re-create the file. The tests need it.
+            await file.save('newcontent', options);
+          });
+        });
 
-        it(
-          'file#rename',
-          doubleTest((options: GetFileOptions, done: SaveCallback) => {
+        it('file#rename', async () => {
+          await requesterPaysDoubleTest(async options => {
             const newFile = bucketNonAllowList.file(generateName());
 
-            file.rename(newFile, options, err => {
-              if (err) {
-                done(err);
-                return;
-              }
+            await file.rename(newFile, options);
 
-              // Re-create the file. The tests need it.
-              file.save('newcontent', options, done);
+            // Re-create the file. The tests need it.
+            await file.save('newcontent', options);
+          });
+        });
+
+        it('file#setMetadata', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.setMetadata({newMetadata: true}, options);
+          });
+        });
+
+        it('file#setStorageClass', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return file.setStorageClass('multi-regional', options);
+          });
+        });
+
+        it('acl#add', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.acl.add({
+              entity: USER_ACCOUNT,
+              role: storage.acl.OWNER_ROLE,
+              ...options,
             });
-          })
-        );
+          });
+        });
 
-        it(
-          'file#setMetadata',
-          doubleTest(
-            (
-              options: SetFileMetadataOptions,
-              done: SetFileMetadataCallback
-            ) => {
-              file.setMetadata({newMetadata: true}, options, done);
-            }
-          )
-        );
-
-        it(
-          'file#setStorageClass',
-          doubleTest(
-            (
-              options: SetStorageClassOptions,
-              done: SetStorageClassCallback
-            ) => {
-              file.setStorageClass('multi-regional', options, done);
-            }
-          )
-        );
-
-        it(
-          'acl#add',
-          doubleTest((options: AddAclOptions, done: AddAclCallback) => {
-            options = Object.assign(
-              {
-                entity: USER_ACCOUNT,
-                role: storage.acl.OWNER_ROLE,
-              },
-              options
-            );
-
-            bucketNonAllowList.acl.add(options, done);
-          })
-        );
-
-        it(
-          'acl#update',
-          doubleTest((options: UpdateAclOptions, done: UpdateAclCallback) => {
-            options = Object.assign(
-              {
-                entity: USER_ACCOUNT,
-                role: storage.acl.WRITER_ROLE,
-              },
-              options
-            );
-
-            bucketNonAllowList.acl.update(options, done);
-          })
-        );
-
-        it(
-          'acl#get',
-          doubleTest((options: GetAclOptions, done: GetAclCallback) => {
-            options = Object.assign(
-              {
-                entity: USER_ACCOUNT,
-              },
-              options
-            );
-
-            bucketNonAllowList.acl.get(options, done);
-          })
-        );
-
-        it(
-          'acl#delete',
-          doubleTest((options: RemoveAclOptions, done: RemoveAclCallback) => {
-            options = Object.assign(
-              {
-                entity: USER_ACCOUNT,
-              },
-              options
-            );
-
-            bucketNonAllowList.acl.delete(options, done);
-          })
-        );
-
-        it(
-          'iam#getPolicy',
-          doubleTest((options: GetPolicyOptions, done: GetPolicyCallback) => {
-            bucketNonAllowList.iam.getPolicy(options, done);
-          })
-        );
-
-        it(
-          'iam#setPolicy',
-          doubleTest((options: GetPolicyOptions, done: SetPolicyCallback) => {
-            bucket.iam.getPolicy((err, policy) => {
-              if (err) {
-                done(err);
-                return;
-              }
-
-              policy!.bindings.push({
-                role: 'roles/storage.objectViewer',
-                members: ['allUsers'],
-              });
-
-              bucketNonAllowList.iam.setPolicy(policy!, options, done);
+        it('acl#update', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.acl.update({
+              entity: USER_ACCOUNT,
+              role: storage.acl.WRITER_ROLE,
+              ...options,
             });
-          })
-        );
+          });
+        });
 
-        it(
-          'iam#testPermissions',
-          doubleTest(
-            (
-              options: TestIamPermissionsOptions,
-              done: TestIamPermissionsCallback
-            ) => {
-              const tests = ['storage.buckets.delete'];
-              bucketNonAllowList.iam.testPermissions(tests, options, done);
-            }
-          )
-        );
+        it('acl#get', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.acl.get({
+              entity: USER_ACCOUNT,
+              ...options,
+            });
+          });
+        });
 
-        it(
-          'notification#get',
-          doubleTest(
-            (
-              options: GetNotificationOptions,
-              done: GetNotificationCallback
-            ) => {
-              if (!notification) {
-                throw new Error('Notification was not successfully created.');
-              }
+        it('acl#delete', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.acl.delete({
+              entity: USER_ACCOUNT,
+              ...options,
+            });
+          });
+        });
 
-              notification.get(options, done);
-            }
-          )
-        );
+        it('iam#getPolicy', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return bucketNonAllowList.iam.getPolicy(options);
+          });
+        });
 
-        it(
-          'notification#getMetadata',
-          doubleTest(
-            (
-              options: GetNotificationMetadataOptions,
-              done: GetNotificationMetadataCallback
-            ) => {
-              if (!notification) {
-                throw new Error('Notification was not successfully created.');
-              }
-              notification.getMetadata(options, done);
-            }
-          )
-        );
+        it('iam#setPolicy', async () => {
+          await requesterPaysDoubleTest(async options => {
+            const [policy] = await bucket.iam.getPolicy();
 
-        it(
-          'notification#delete',
-          doubleTest(
-            (
-              options: DeleteNotificationOptions,
-              done: DeleteNotificationCallback
-            ) => {
-              if (!notification) {
-                throw new Error('Notification was not successfully created.');
-              }
-              notification.delete(options, done);
-            }
-          )
-        );
+            policy.bindings.push({
+              role: 'roles/storage.objectViewer',
+              members: ['allUsers'],
+            });
+
+            return bucketNonAllowList.iam.setPolicy(policy, options);
+          });
+        });
+
+        it('iam#testPermissions', async () => {
+          await requesterPaysDoubleTest(async options => {
+            const tests = ['storage.buckets.delete'];
+
+            return bucketNonAllowList.iam.testPermissions(tests, options);
+          });
+        });
+
+        it('notification#get', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return notification.get(options);
+          });
+        });
+
+        it('notification#getMetadata', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return notification.getMetadata(options);
+          });
+        });
+
+        it('notification#delete', async () => {
+          await requesterPaysDoubleTest(async options => {
+            return notification.delete(options);
+          });
+        });
       });
     });
   });
 
   describe('write, read, and remove files', () => {
+    const FILE_DOWNLOAD_START_BYTE = 0;
+    const FILE_DOWNLOAD_END_BYTE = 20;
+
     before(async () => {
       function setHash(filesKey: string) {
         const file = FILES[filesKey];
         const hash = crypto.createHash('md5');
 
-        return new Promise(resolve =>
+        return new Promise<void>(resolve =>
           fs
             .createReadStream(file.path)
             .on('data', hash.update.bind(hash))
@@ -2396,7 +2437,7 @@ describe('storage', () => {
       bucket.upload(FILES.big.path, (err: Error | null, file?: File | null) => {
         assert.ifError(err);
 
-        const fileSize = file!.metadata.size;
+        const fileSize = parseInt(file!.metadata.size!.toString());
         const byteRange = {
           start: Math.floor((fileSize * 1) / 3),
           end: Math.floor((fileSize * 2) / 3),
@@ -2430,42 +2471,60 @@ describe('storage', () => {
       assert.strictEqual(String(fileContents), String(remoteContents));
     });
 
-    it('should download a file to memory', done => {
+    it('should download a file to memory', async () => {
       const fileContents = fs.readFileSync(FILES.big.path);
-      bucket.upload(FILES.big.path, (err: Error | null, file?: File | null) => {
-        assert.ifError(err);
-        file!.download((err, remoteContents) => {
-          assert.ifError(err);
-          assert.strictEqual(String(fileContents), String(remoteContents));
-          done();
-        });
-      });
+      const [file] = await bucket.upload(FILES.big.path);
+      const [remoteContents] = await file.download();
+      assert.strictEqual(String(fileContents), String(remoteContents));
     });
 
-    it('should handle non-network errors', done => {
+    it('should download an entire file if range `start:0` is provided', async () => {
+      const fileContents = fs.readFileSync(FILES.big.path);
+      const [file] = await bucket.upload(FILES.big.path);
+      const [result] = await file.download({start: 0});
+
+      assert.strictEqual(result.toString(), fileContents.toString());
+    });
+
+    it('should download an empty file', async () => {
+      const fileContents = fs.readFileSync(FILES.empty.path);
+      const [file] = await bucket.upload(FILES.empty.path);
+      const [remoteContents] = await file.download();
+      assert.strictEqual(String(fileContents), String(remoteContents));
+    });
+
+    it('should download the specified bytes of a file', async () => {
+      const fileContents = fs.readFileSync(FILES.big.path);
+      const [file] = await bucket.upload(FILES.big.path);
+      const [remoteContents] = await file!.download({
+        start: FILE_DOWNLOAD_START_BYTE,
+        end: FILE_DOWNLOAD_END_BYTE,
+      });
+      assert.strictEqual(
+        String(fileContents).slice(0, 20),
+        String(remoteContents)
+      );
+    });
+
+    it('should handle non-network errors', async () => {
       const file = bucket.file('hi.jpg');
-      file.download(err => {
+      assert.rejects(file.download(), (err: ApiError) => {
         assert.strictEqual((err as ApiError).code, 404);
-        done();
       });
     });
 
-    it('should gzip a file on the fly and download it', done => {
+    it('should gzip a file on the fly and download it', async () => {
       const options = {
         gzip: true,
       };
       const expectedContents = fs.readFileSync(FILES.html.path, 'utf-8');
-      bucket.upload(FILES.html.path, options, (err, file) => {
-        assert.ifError(err);
-        file!.download((err, contents) => {
-          assert.ifError(err);
-          assert.strictEqual(contents.toString(), expectedContents);
-          file!.delete(done);
-        });
-      });
+      const [file] = await bucket.upload(FILES.html.path, options);
+      const [contents] = await file.download();
+      assert.strictEqual(contents.toString(), expectedContents);
+      await file.delete();
     });
 
-    it('should upload a gzipped file and download it', done => {
+    it('should upload a gzipped file and download it', async () => {
       const options = {
         metadata: {
           contentEncoding: 'gzip',
@@ -2473,33 +2532,29 @@ describe('storage', () => {
         },
       };
 
-      const expectedContents = fs
-        .readFileSync(FILES.html.path, 'utf-8')
-        // eslint-disable-next-line no-control-regex
-        .replace(new RegExp('\r\n', 'g'), '\n');
+      const expectedContents = fs.readFileSync(FILES.html.path, 'utf-8');
 
-      bucket.upload(FILES.gzip.path, options, (err, file) => {
-        assert.ifError(err);
+      // Prepare temporary gzip file for upload
+      tmp.setGracefulCleanup();
+      const {name: tmpGzFilePath} = tmp.fileSync({postfix: '.gz'});
+      fs.writeFileSync(tmpGzFilePath, gzipSync(expectedContents));
 
-        // Sometimes this file is not found immediately; include some
-        // retry to attempt to make the test less flaky.
-        let attempt = 0;
-        const downloadCallback = (err: Error | null, contents: {}) => {
-          // If we got an error, gracefully retry a few times.
-          if (err) {
-            attempt += 1;
-            if (attempt >= 5) {
-              return assert.ifError(err);
-            }
-            return file!.download(downloadCallback);
-          }
-
-          // Ensure the contents match.
-          assert.strictEqual(contents.toString(), expectedContents);
-          file!.delete(done);
-        };
-        file!.download(downloadCallback);
+      const file: File = await new Promise((resolve, reject) => {
+        bucket.upload(tmpGzFilePath, options, (err, file) => {
+          if (err || !file) return reject(err);
+          resolve(file);
+        });
       });
+
+      const contents: Buffer = await new Promise((resolve, reject) => {
+        return file.download((error, content) => {
+          if (error) return reject(error);
+          resolve(content);
+        });
+      });
+
+      assert.strictEqual(contents.toString(), expectedContents);
+      await file.delete();
     });
 
     it('should skip validation if file is served decompressed', async () => {
@@ -2530,16 +2585,12 @@ describe('storage', () => {
     });
 
     describe('simple write', () => {
-      it('should save arbitrary data', done => {
+      it('should save arbitrary data', async () => {
         const file = bucket.file('TestFile');
         const data = 'hello';
-        file!.save(data, err => {
-          assert.ifError(err);
-          file!.download((err, contents) => {
-            assert.strictEqual(contents.toString(), data);
-            done();
-          });
-        });
+        await file!.save(data);
+        const [contents] = await file!.download();
+        assert.strictEqual(contents.toString(), data);
       });
     });
 
@@ -2555,29 +2606,21 @@ describe('storage', () => {
           });
       });
 
-      it('should write metadata', done => {
+      it('should write metadata', async () => {
         const options = {
           metadata: {contentType: 'image/png'},
           resumable: false,
         };
-        bucket.upload(FILES.logo.path, options, (err, file) => {
-          assert.ifError(err);
-          file!.getMetadata((err: ApiError | null, metadata: Metadata) => {
-            assert.ifError(err);
-            assert.strictEqual(
-              metadata.contentType,
-              options.metadata.contentType
-            );
-            file!.delete(done);
-          });
-        });
+        const [file] = await bucket.upload(FILES.logo.path, options);
+        const [metadata] = await file.getMetadata();
+        assert.strictEqual(metadata.contentType, options.metadata.contentType);
+        await file.delete();
       });
 
       it('should resume an upload after an interruption', done => {
         fs.stat(FILES.big.path, (err, metadata) => {
           assert.ifError(err);
 
-          // Use a random name to force an empty ConfigStore cache.
           const file = bucket.file(generateName());
           const fileSize = metadata.size;
           upload({interrupt: true}, err => {
@@ -2662,35 +2705,22 @@ describe('storage', () => {
       });
       const unencryptedFile = bucket.file(file.name);
 
-      before(done => {
-        file.save('secret data', {resumable: false}, done);
+      before(async () => {
+        await file.save('secret data', {resumable: false});
       });
 
-      it('should not get the hashes from the unencrypted file', done => {
-        unencryptedFile.getMetadata(
-          (err: ApiError | null, metadata: Metadata) => {
-            assert.ifError(err);
-            assert.strictEqual(metadata.crc32c, undefined);
-            done();
-          }
-        );
+      it('should not get the hashes from the unencrypted file', async () => {
+        const [metadata] = await unencryptedFile.getMetadata();
+        assert.strictEqual(metadata.crc32c, undefined);
       });
 
-      it('should get the hashes from the encrypted file', done => {
-        file.getMetadata((err: ApiError | null, metadata: Metadata) => {
-          assert.ifError(err);
-          assert.notStrictEqual(metadata.crc32c, undefined);
-          done();
-        });
+      it('should get the hashes from the encrypted file', async () => {
+        const [metadata] = await file.getMetadata();
+        assert.notStrictEqual(metadata.crc32c, undefined);
       });
 
-      it('should not download from the unencrypted file', done => {
-        unencryptedFile.download(err => {
-          if (!err) {
-            done(new Error('Expected an error.'));
-            return;
-          }
-
+      it('should not download from the unencrypted file', async () => {
+        assert.rejects(unencryptedFile.download(), (err: ApiError) => {
           assert(
             err!.message.indexOf(
               [
@@ -2699,29 +2729,19 @@ describe('storage', () => {
               ].join(' ')
             ) > -1
           );
-          done();
         });
       });
 
-      it('should download from the encrytped file', done => {
-        file.download((err, contents) => {
-          assert.ifError(err);
-          assert.strictEqual(contents.toString(), 'secret data');
-          done();
-        });
+      it('should download from the encrytped file', async () => {
+        const [contents] = await file.download();
+        assert.strictEqual(contents.toString(), 'secret data');
       });
 
-      it('should rotate encryption keys', done => {
+      it('should rotate encryption keys', async () => {
         const newEncryptionKey = crypto.randomBytes(32);
-
-        file.rotateEncryptionKey(newEncryptionKey, err => {
-          assert.ifError(err);
-          file.download((err, contents) => {
-            assert.ifError(err);
-            assert.strictEqual(contents.toString(), 'secret data');
-            done();
-          });
-        });
+        await file.rotateEncryptionKey(newEncryptionKey);
+        const [contents] = await file.download();
+        assert.strictEqual(contents.toString(), 'secret data');
       });
     });
 
@@ -2801,59 +2821,47 @@ describe('storage', () => {
       describe('files', () => {
         let file: File;
 
-        before(done => {
+        before(async () => {
           file = bucket.file('kms-encrypted-file', {kmsKeyName});
-          file.save(FILE_CONTENTS, {resumable: false}, done);
+          await file.save(FILE_CONTENTS, {resumable: false});
         });
 
-        it('should have set kmsKeyName on created file', done => {
-          file.getMetadata((err: ApiError | null, metadata: Metadata) => {
-            assert.ifError(err);
+        it('should have set kmsKeyName on created file', async () => {
+          const [metadata] = await file.getMetadata();
 
-            // Strip the project ID, as it could be the placeholder locally, but
-            // the real value upstream.
-            const projectIdRegExp = /^.+\/locations/;
-            const actualKmsKeyName = metadata.kmsKeyName.replace(
-              projectIdRegExp,
-              ''
-            );
-            let expectedKmsKeyName = kmsKeyName.replace(projectIdRegExp, '');
+          // Strip the project ID, as it could be the placeholder locally, but
+          // the real value upstream.
+          const projectIdRegExp = /^.+\/locations/;
+          const actualKmsKeyName = metadata!.kmsKeyName!.replace(
+            projectIdRegExp,
+            ''
+          );
+          let expectedKmsKeyName = kmsKeyName.replace(projectIdRegExp, '');
 
-            // Upstream attaches a version.
-            expectedKmsKeyName = `${expectedKmsKeyName}/cryptoKeyVersions/1`;
+          // Upstream attaches a version.
+          expectedKmsKeyName = `${expectedKmsKeyName}/cryptoKeyVersions/1`;
 
-            assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
-
-            done();
-          });
+          assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
         });
 
-        it('should set kmsKeyName on resumable uploaded file', done => {
+        it('should set kmsKeyName on resumable uploaded file', async () => {
           const file = bucket.file('resumable-file', {kmsKeyName});
+          await file.save(FILE_CONTENTS, {resumable: true});
+          const [metadata] = await file.getMetadata();
 
-          file.save(FILE_CONTENTS, {resumable: true}, err => {
-            assert.ifError(err);
+          // Strip the project ID, as it could be the placeholder locally,
+          // but the real value upstream.
+          const projectIdRegExp = /^.+\/locations/;
+          const actualKmsKeyName = metadata!.kmsKeyName!.replace(
+            projectIdRegExp,
+            ''
+          );
+          let expectedKmsKeyName = kmsKeyName.replace(projectIdRegExp, '');
 
-            file.getMetadata((err: ApiError | null, metadata: Metadata) => {
-              assert.ifError(err);
+          // Upstream attaches a version.
+          expectedKmsKeyName = `${expectedKmsKeyName}/cryptoKeyVersions/1`;
 
-              // Strip the project ID, as it could be the placeholder locally,
-              // but the real value upstream.
-              const projectIdRegExp = /^.+\/locations/;
-              const actualKmsKeyName = metadata.kmsKeyName.replace(
-                projectIdRegExp,
-                ''
-              );
-              let expectedKmsKeyName = kmsKeyName.replace(projectIdRegExp, '');
-
-              // Upstream attaches a version.
-              expectedKmsKeyName = `${expectedKmsKeyName}/cryptoKeyVersions/1`;
-
-              assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
-
-              done();
-            });
-          });
+          assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
         });
 
         it('should rotate encryption keys', async () => {
@@ -2866,24 +2874,13 @@ describe('storage', () => {
           assert.strictEqual(contents.toString(), FILE_CONTENTS);
         });
 
-        it('should convert CSEK to KMS key', done => {
+        it('should convert CSEK to KMS key', async () => {
           const encryptionKey = crypto.randomBytes(32);
-
           const file = bucket.file('encrypted-file', {encryptionKey});
-
-          file.save(FILE_CONTENTS, {resumable: false}, err => {
-            assert.ifError(err);
-
-            file.rotateEncryptionKey({kmsKeyName}, err => {
-              assert.ifError(err);
-
-              file.download((err, contents) => {
-                assert.ifError(err);
-                assert.strictEqual(contents.toString(), 'secret data');
-                done();
-              });
-            });
-          });
+          await file.save(FILE_CONTENTS, {resumable: false});
+          await file.rotateEncryptionKey({kmsKeyName});
+          const [contents] = await file.download();
+          assert.strictEqual(contents.toString(), 'secret data');
         });
       });
 
@@ -2893,6 +2890,12 @@ describe('storage', () => {
         before(async () => {
           bucket = storage.bucket(generateName(), {kmsKeyName});
           await bucket.create();
+        });
+
+        beforeEach(async () => {
+          await new Promise(res =>
+            setTimeout(res, BUCKET_METADATA_UPDATE_WAIT_TIME)
+          );
           await bucket.setMetadata({
             encryption: {
               defaultKmsKeyName: kmsKeyName,
@@ -2900,33 +2903,27 @@ describe('storage', () => {
           });
         });
 
-        after(done => {
-          bucket.setMetadata(
-            {
-              encryption: null,
-            },
-            done
+        afterEach(async () => {
+          await new Promise(res =>
+            setTimeout(res, BUCKET_METADATA_UPDATE_WAIT_TIME)
           );
+          await bucket.setMetadata({
+            encryption: null,
+          });
         });
 
-        it('should have set defaultKmsKeyName on created bucket', done => {
-          bucket.getMetadata((err: ApiError | null, metadata: Metadata) => {
-            assert.ifError(err);
-
-            // Strip the project ID, as it could be the placeholder locally, but
-            // the real value upstream.
-            const projectIdRegExp = /^.+\/locations/;
-            const actualKmsKeyName =
-              metadata.encryption.defaultKmsKeyName.replace(
-                projectIdRegExp,
-                ''
-              );
-            const expectedKmsKeyName = kmsKeyName.replace(projectIdRegExp, '');
-
-            assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
-
-            done();
-          });
+        it('should have set defaultKmsKeyName on created bucket', async () => {
+          const [metadata] = await bucket.getMetadata();
+          // Strip the project ID, as it could be the placeholder locally, but
+          // the real value upstream.
+          const projectIdRegExp = /^.+\/locations/;
+          const actualKmsKeyName =
+            metadata!.encryption!.defaultKmsKeyName!.replace(
+              projectIdRegExp,
+              ''
+            );
+          const expectedKmsKeyName = kmsKeyName.replace(projectIdRegExp, '');
+          assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
         });
 
         it('should update the defaultKmsKeyName', async () => {
@@ -2934,6 +2931,9 @@ describe('storage', () => {
           const newKmsKeyName = generateKmsKeyName(cryptoKeyId);
 
           await createCryptoKeyAsync(cryptoKeyId);
+          await new Promise(res =>
+            setTimeout(res, BUCKET_METADATA_UPDATE_WAIT_TIME)
+          );
           await bucket.setMetadata({
             encryption: {
               defaultKmsKeyName: newKmsKeyName,
@@ -2941,37 +2941,16 @@ describe('storage', () => {
           });
         });
 
-        it('should insert an object that inherits the kms key name', done => {
+        it('should insert an object that inherits the kms key name', async () => {
           const file = bucket.file('kms-encrypted-file');
+          const [metadata] = await bucket.getMetadata();
+          await file.save(FILE_CONTENTS, {resumable: false});
+          const [fileMetadata] = await file.getMetadata();
 
-          bucket.getMetadata((err: ApiError | null, metadata: Metadata) => {
-            assert.ifError(err);
-
-            const defaultKmsKeyName = metadata.encryption.defaultKmsKeyName;
-
-            file.save(FILE_CONTENTS, {resumable: false}, err => {
-              assert.ifError(err);
-
-              // Strip the project ID, as it could be the placeholder locally,
-              // but the real value upstream.
-              const projectIdRegExp = /^.+\/locations/;
-              const actualKmsKeyName = file.metadata.kmsKeyName.replace(
-                projectIdRegExp,
-                ''
-              );
-              let expectedKmsKeyName = defaultKmsKeyName.replace(
-                projectIdRegExp,
-                ''
-              );
-
-              // Upstream attaches a version.
-              expectedKmsKeyName = `${expectedKmsKeyName}/cryptoKeyVersions/1`;
-
-              assert.strictEqual(actualKmsKeyName, expectedKmsKeyName);
-
-              done();
-            });
-          });
+          assert.strictEqual(
+            fileMetadata.kmsKeyName,
+            `${metadata!.encryption!.defaultKmsKeyName}/cryptoKeyVersions/1`
+          );
         });
       });
     });
@@ -2997,10 +2976,10 @@ describe('storage', () => {
       const [copiedFile] = await file.copy('CloudLogoCopy', copyOpts);
       const [metadata] = await copiedFile.getMetadata();
       assert.strictEqual(
-        typeof metadata.metadata.originalProperty,
+        typeof metadata!.metadata!.originalProperty,
         'undefined'
       );
-      assert.strictEqual(metadata.metadata.newProperty, 'true');
+      assert.strictEqual(metadata!.metadata!.newProperty, 'true');
       await Promise.all([file.delete, copiedFile.delete()]);
     });
 
@@ -3050,32 +3029,17 @@ describe('storage', () => {
       await file.delete();
     });
 
-    it('should copy to another bucket given a gs:// URL', done => {
+    it('should copy to another bucket given a gs:// URL', async () => {
       const opts = {destination: 'CloudLogo'};
-      bucket.upload(FILES.logo.path, opts, (err, file) => {
-        assert.ifError(err);
-
-        const otherBucket = storage.bucket(generateName());
-        otherBucket.create((err: Error) => {
-          assert.ifError(err);
-
-          const destPath = 'gs://' + otherBucket.name + '/CloudLogoCopy';
-          file!.copy(destPath, err => {
-            assert.ifError(err);
-
-            otherBucket.getFiles((err, files) => {
-              assert.ifError(err);
-
-              assert.strictEqual(files!.length, 1);
-              const newFile = files![0];
-
-              assert.strictEqual(newFile.name, 'CloudLogoCopy');
-
-              done();
-            });
-          });
-        });
-      });
+      const [file] = await bucket.upload(FILES.logo.path, opts);
+      const otherBucket = storage.bucket(generateName());
+      await otherBucket.create();
+      const destPath = 'gs://' + otherBucket.name + '/CloudLogoCopy';
+      await file!.copy(destPath);
+      const [files] = await otherBucket.getFiles();
+      assert.strictEqual(files!.length, 1);
+      const newFile = files![0];
+      assert.strictEqual(newFile.name, 'CloudLogoCopy');
     });
 
     it('should allow changing the storage class', async () => {
@@ -3084,6 +3048,80 @@ describe('storage', () => {
       await file.setStorageClass('standard');
       const [metadata] = await file.getMetadata();
       assert.strictEqual(metadata.storageClass, 'STANDARD');
+    });
+  });
+
+  describe('resumable upload', () => {
+    describe('multi-chunk upload', () => {
+      describe('upload configurations', () => {
+        const filePath: string = FILES.big.path;
+        const fileSize = fs.statSync(filePath).size;
+        let crc32c: string;
+
+        before(async () => {
+          // get a CRC32C value from the file
+          crc32c = (await CRC32C.fromFile(filePath)).toString();
+        });
+
+        async function uploadAndVerify(
+          file: File,
+          options: Omit<UploadOptions, 'destination'>
+        ) {
+          await bucket.upload(filePath, {
+            destination: file,
+            ...options,
+          });
+
+          const [metadata] = await file.getMetadata();
+
+          // assert we uploaded the expected data
+          assert.equal(metadata.crc32c, crc32c);
+        }
+
+        it('should support uploads where `contentLength < chunkSize`', async () => {
+          const file = bucket.file(generateName());
+
+          const metadata = {contentLength: fileSize};
+          // off by +1 to ensure `contentLength < chunkSize`
+          const chunkSize = fileSize + 1;
+
+          await uploadAndVerify(file, {chunkSize, metadata});
+        });
+
+        it('should support uploads where `contentLength % chunkSize != 0`', async () => {
+          const file = bucket.file(generateName());
+
+          const metadata = {contentLength: fileSize};
+          // off by -1 to ensure `contentLength % chunkSize != 0`
+          const chunkSize = fileSize - 1;
+
+          await uploadAndVerify(file, {chunkSize, metadata});
+        });
+
+        it('should support uploads where `fileSize % chunkSize != 0` && `!contentLength`', async () => {
+          const file = bucket.file(generateName());
+          // off by +1 to ensure `fileSize % chunkSize != 0`
+          const chunkSize = fileSize + 1;
+
+          await uploadAndVerify(file, {chunkSize});
+        });
+
+        it('should support uploads where `fileSize < chunkSize && `!contentLength`', async () => {
+          const file = bucket.file(generateName());
+          // off by `* 2 +1` to ensure `fileSize < chunkSize`
+          const chunkSize = fileSize * 2 + 1;
+
+          await uploadAndVerify(file, {chunkSize});
+        });
+
+        it('should support uploads where `fileSize > chunkSize` && `!contentLength`', async () => {
+          const file = bucket.file(generateName());
+          // off by -1 to ensure `fileSize > chunkSize`
+          const chunkSize = fileSize - 1;
+
+          await uploadAndVerify(file, {chunkSize});
+        });
+      });
     });
   });
 
@@ -3123,14 +3161,13 @@ describe('storage', () => {
   });
 
   describe('channels', () => {
-    it('should stop a channel', done => {
+    it('should stop a channel', async () => {
       // We can't actually create a channel. But we can test to see that we're
       // reaching the right endpoint with the API request.
       const channel = storage.channel('id', 'resource-id');
-      channel.stop(err => {
+      assert.rejects(channel.stop(), (err: ApiError) => {
         assert.strictEqual((err as ApiError).code, 404);
         assert.strictEqual(err!.message.indexOf("Channel 'id' not found"), 0);
-        done();
       });
     });
   });
@@ -3160,7 +3197,8 @@ describe('storage', () => {
     });
   });
 
-  describe('HMAC keys', () => {
+  // TODO: Undo this skip once https://github.com/googleapis/nodejs-storage/issues/2461 is complete.
+  describe.skip('HMAC keys', () => {
     // This is generally a valid service account for a project.
     const ALTERNATE_SERVICE_ACCOUNT = `${process.env.PROJECT_ID}@appspot.gserviceaccount.com`;
     const SERVICE_ACCOUNT =
@@ -3176,9 +3214,8 @@ describe('storage', () => {
 
     const delay = async (test: Mocha.Context, accessId: string) => {
       const retries = test.currentRetry();
-      if (retries === 0) return; // no retry on the first failure.
       // see: https://cloud.google.com/storage/docs/exponential-backoff:
-      const ms = Math.pow(2, retries) * 500 + Math.random() * 1000;
+      const ms = Math.pow(2, retries) * 1000 + Math.random() * 1000;
       return new Promise(done => {
         console.info(
           `retrying "${test.title}" with accessId ${accessId} in ${ms}ms`
@@ -3212,7 +3249,6 @@ describe('storage', () => {
     });
 
     it('should get metadata for an HMAC key', async function () {
-      this.retries(3);
       delay(this, accessId);
       const hmacKey = storage.hmacKey(accessId, {projectId: HMAC_PROJECT});
       const [metadata] = await hmacKey.getMetadata();
@@ -3343,12 +3379,37 @@ describe('storage', () => {
       await Promise.all(NEW_FILES.map(file => deleteFileAsync(file)));
     });
 
-    it('should get files', done => {
-      bucket.getFiles((err, files) => {
-        assert.ifError(err);
-        assert.strictEqual(files!.length, NEW_FILES.length);
-        done();
+    it('should get files', async () => {
+      const [files] = await bucket.getFiles();
+      assert.strictEqual(files!.length, NEW_FILES.length);
+    });
+
+    it('returns file name only when fields is set as name', async () => {
+      const expected = [
+        {name: 'CloudLogo1'},
+        {name: 'CloudLogo2'},
+        {name: 'CloudLogo3'},
+        {name: `${DIRECTORY_NAME}/CloudLogo4`},
+        {name: `${DIRECTORY_NAME}/CloudLogo5`},
+        {name: `${DIRECTORY_NAME}/inner/CloudLogo6`},
+      ];
+      const [files] = await bucket.getFiles({fields: 'items(name)'});
+
+      assert.deepStrictEqual(files, expected);
+    });
+
+    it('returns folders as prefixes when includeFoldersAsPrefixes is set', async () => {
+      const expected = [`${DIRECTORY_NAME}/`];
+      const [, , result] = await bucket.getFiles({
+        delimiter: '/',
+        includeFoldersAsPrefixes: true,
+        autoPaginate: false,
       });
+
+      assert.deepStrictEqual(
+        (result as {prefixes: string[]}).prefixes,
+        expected
+      );
     });
 
     it('should get files as a stream', done => {
@@ -3366,46 +3427,39 @@ describe('storage', () => {
         });
     });
 
-    it('should get files from a directory', done => {
-      //Note: Directory is deprecated.
-      bucket.getFiles({directory: DIRECTORY_NAME}, (err, files) => {
-        assert.ifError(err);
-        assert.strictEqual(files!.length, 3);
-        done();
+    it('should only get files matching the supplied matchGlob argument', async () => {
+      let expectedFileNames = ['CloudLogo1', 'CloudLogo2', 'CloudLogo3'];
+      let [files] = await bucket.getFiles({matchGlob: 'CloudLogo*'});
+      assert.strictEqual(files.length, expectedFileNames.length);
+      for (const curFile of files) {
+        assert.strictEqual(expectedFileNames.includes(curFile.name), true);
+      }
+
+      expectedFileNames = [
+        `${DIRECTORY_NAME}/CloudLogo4`,
+        `${DIRECTORY_NAME}/CloudLogo5`,
+        `${DIRECTORY_NAME}/inner/CloudLogo6`,
+      ];
+      [files] = await bucket.getFiles({
+        matchGlob: `${DIRECTORY_NAME}/**/CloudLogo*`,
       });
+      assert.strictEqual(files.length, expectedFileNames.length);
+      for (const curFile of files) {
+        assert.strictEqual(expectedFileNames.includes(curFile.name), true);
+      }
     });
 
-    it('should get files from a directory as a stream', done => {
-      //Note: Directory is deprecated.
-      let numFilesEmitted = 0;
-
-      bucket
-        .getFilesStream({directory: DIRECTORY_NAME})
-        .on('error', done)
-        .on('data', () => {
-          numFilesEmitted++;
-        })
-        .on('end', () => {
-          assert.strictEqual(numFilesEmitted, 3);
-          done();
-        });
-    });
-
-    it('should paginate the list', done => {
+    it('should paginate the list', async () => {
       const query = {
         maxResults: NEW_FILES.length - 1,
       };
 
-      bucket.getFiles(query, (err, files, nextQuery) => {
-        assert.ifError(err);
-        assert.strictEqual(files!.length, NEW_FILES.length - 1);
-        assert(nextQuery);
-        bucket.getFiles(nextQuery!, (err, files) => {
-          assert.ifError(err);
-          assert.strictEqual(files!.length, 1);
-          done();
-        });
-      });
+      const [files, nextQuery] = await bucket.getFiles(query);
+
+      assert.strictEqual(files!.length, NEW_FILES.length - 1);
+      assert(nextQuery);
+      const [nextFiles] = await bucket.getFiles(nextQuery);
+      assert.strictEqual(nextFiles!.length, 1);
     });
   });
 
@@ -3455,63 +3509,32 @@ describe('storage', () => {
   describe('file generations', () => {
     const bucketWithVersioning = storage.bucket(generateName());
 
-    before(done => {
-      bucketWithVersioning.create(
-        {
-          versioning: {
-            enabled: true,
-          },
+    before(async () => {
+      await bucketWithVersioning.create({
+        versioning: {
+          enabled: true,
         },
-        done
-      );
-    });
-
-    after(done => {
-      bucketWithVersioning.deleteFiles(
-        {
-          versions: true,
-        },
-        err => {
-          if (err) {
-            done(err);
-            return;
-          }
-          bucketWithVersioning.delete(done);
-        }
-      );
-    });
-
-    it('should overwrite file, then get older version', done => {
-      const versionedFile = bucketWithVersioning.file(generateName());
-
-      versionedFile.save('a', err => {
-        assert.ifError(err);
-
-        versionedFile.getMetadata(
-          (err: ApiError | null, metadata: Metadata) => {
-            assert.ifError(err);
-
-            const initialGeneration = metadata.generation;
-
-            versionedFile.save('b', err => {
-              assert.ifError(err);
-
-              const firstGenFile = bucketWithVersioning.file(
-                versionedFile.name,
-                {
-                  generation: initialGeneration,
-                }
-              );
-
-              firstGenFile.download((err, contents) => {
-                assert.ifError(err);
-                assert.strictEqual(contents.toString(), 'a');
-                done();
-              });
-            });
-          }
-        );
       });
+    });
+
+    after(async () => {
+      await bucketWithVersioning.deleteFiles({
+        versions: true,
+      });
+      await bucketWithVersioning.delete();
+    });
+
+    it('should overwrite file, then get older version', async () => {
+      const versionedFile = bucketWithVersioning.file(generateName());
+      await versionedFile.save('a');
+      const [metadata] = await versionedFile.getMetadata();
+      const initialGeneration = metadata.generation;
+      await versionedFile.save('b');
+      const firstGenFile = bucketWithVersioning.file(versionedFile.name, {
+        generation: initialGeneration,
+      });
+      const [contents] = await firstGenFile.download();
+      assert.strictEqual(contents.toString(), 'a');
     });
 
     it('should get all files scoped to their version', async () => {
@@ -3657,6 +3680,31 @@ describe('storage', () => {
       const res = await fetch(signedReadUrl);
       const body = await res.text();
       assert.strictEqual(body, localFile.toString());
+    });
+
+    it('should not throw with expiration of exactly 7 days', async () => {
+      const ACCESSIBLE_AT = new Date().setMilliseconds(999).valueOf();
+      const SEVEN_DAYS_IN_SECONDS = 7 * 24 * 60 * 60;
+      const SEVEN_DAYS_IN_MS = SEVEN_DAYS_IN_SECONDS * 1000;
+      await assert.doesNotReject(
+        async () => {
+          await file.getSignedUrl({
+            version: 'v4',
+            action: 'read',
+            accessibleAt: ACCESSIBLE_AT,
+            expires: ACCESSIBLE_AT + SEVEN_DAYS_IN_MS,
+            virtualHostedStyle: true,
+          });
+        },
+        err => {
+          assert(err instanceof Error);
+          assert.strictEqual(
+            err.message,
+            `Max allowed expiration is seven days (${SEVEN_DAYS_IN_SECONDS.toString()} seconds).`
+          );
+          return true;
+        }
+      );
     });
 
     it('should create a signed read url with accessibleAt in the past', async () => {
@@ -3831,90 +3879,65 @@ describe('storage', () => {
 
   describe('notifications', () => {
     let notification: Notification;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let subscription: any;
+    let subscription: Subscription;
 
-    before(() => {
-      return bucket
-        .createNotification(topic, {
+    before(async () => {
+      const createNotificationData = await bucket.createNotification(
+        topic.name,
+        {
           eventTypes: ['OBJECT_FINALIZE'],
-        })
-        .then(data => {
-          notification = data[0];
-          subscription = topic.subscription(generateName());
-
-          return subscription.create();
-        });
-    });
-
-    after(() => {
-      return (
-        subscription
-          .delete()
-          .then(() => {
-            return bucket.getNotifications();
-          })
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          .then((data: any) => {
-            return Promise.all(
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              data[0].map((notification: any) => {
-                return notification.delete();
-              })
-            );
-          })
+        }
       );
+      notification = createNotificationData[0];
+      subscription = topic.subscription(generateName());
+      await subscription.create();
     });
 
-    it('should get an existing notification', done => {
-      notification.get(err => {
-        assert.ifError(err);
-        assert(Object.keys(notification.metadata).length > 0);
-        done();
+    after(async () => {
+      await subscription.delete();
+      const notifications = await bucket.getNotifications();
+      const notificationsToDelete = notifications[0].map(notification => {
+        return notification.delete();
       });
+      await Promise.all(notificationsToDelete);
     });
 
-    it('should get a notifications metadata', done => {
-      notification.getMetadata((err: ApiError | null, metadata: Metadata) => {
-        assert.ifError(err);
-        assert(metadata !== null && typeof metadata === 'object');
-        done();
-      });
+    it('should get an existing notification', async () => {
+      await notification.get();
+      assert(Object.keys(notification.metadata).length > 0);
     });
 
-    it('should tell us if a notification exists', done => {
-      notification.exists((err: ApiError | null, exists: boolean) => {
-        assert.ifError(err);
-        assert(exists);
-        done();
-      });
+    it('should get a notifications metadata', async () => {
+      const [metadata] = await notification.getMetadata();
+      assert(metadata !== null && typeof metadata === 'object');
     });
 
-    it('should tell us if a notification does not exist', done => {
+    it('should tell us if a notification exists', async () => {
+      const [exists] = await notification.exists();
+      assert(exists);
+    });
+
+    it('should tell us if a notification does not exist', async () => {
       const notification = bucket.notification('123');
-
-      notification.exists((err: ApiError | null, exists: boolean) => {
-        assert.ifError(err);
-        assert.strictEqual(exists, false);
-        done();
-      });
+      const [exists] = await notification.exists();
+      assert.strictEqual(exists, false);
     });
 
-    it('should get a list of notifications', done => {
-      bucket.getNotifications((err, notifications) => {
-        assert.ifError(err);
-        assert.strictEqual(notifications!.length, 1);
-        done();
-      });
+    it('should get a list of notifications', async () => {
+      const [notifications] = await bucket.getNotifications();
+      assert.strictEqual(notifications!.length, 1);
     });
 
     it('should emit events to a subscription', done => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      subscription.on('error', done).on('message', (message: any) => {
-        const attrs = message.attributes;
-        assert.strictEqual(attrs.eventType, 'OBJECT_FINALIZE');
-        done();
-      });
+      subscription
+        .on('error', err => {
+          done(err);
+        })
+        .on('message', message => {
+          const attrs = message.attributes;
+          assert.strictEqual(attrs.eventType, 'OBJECT_FINALIZE');
+          done();
+        });
 
       bucket.upload(FILES.logo.path, (err: Error | null) => {
         if (err) {
@@ -3928,7 +3951,7 @@ describe('storage', () => {
       let notification: Notification;
 
       return bucket
-        .createNotification(topic, {
+        .createNotification(topic.name, {
           eventTypes: ['OBJECT_DELETE'],
         })
         .then(data => {
@@ -3945,6 +3968,98 @@ describe('storage', () => {
         .then(data => {
           assert.strictEqual(data[0].length, notificationCount - 1);
         });
+    });
+  });
+
+  describe('CRC32C', () => {
+    const KNOWN_INPUT_TO_CRC32C = {
+      /** empty string (i.e. nothing to 'update') */
+      '': 'AAAAAA==',
+      /** known case #1 - validated from actual GCS object upload + metadata retrieval */
+      data: 'rth90Q==',
+      /** known case #2 - validated from actual GCS object upload + metadata retrieval */
+      'some text\n': 'DkjKuA==',
+      /** arbitrary large string */
+      ['a'.repeat(2 ** 16)]: 'TpXtPw==',
+    } as const;
+
+    it('should generate the appropriate hashes', async () => {
+      const file = bucket.file('crc32c-test-file');
+
+      for (const [input, expected] of Object.entries(KNOWN_INPUT_TO_CRC32C)) {
+        const buffer = Buffer.from(input);
+        const crc32c = new CRC32C();
+
+        await file.save(buffer);
+        crc32c.update(buffer);
+
+        const [metadata] = await file.getMetadata();
+
+        assert.equal(metadata.crc32c, expected);
+        assert(crc32c.validate(metadata.crc32c!));
+      }
+    });
+  });
+
+  describe('universeDomainTests', () => {
+    let universeDomainStorage: Storage;
+    const bucketName = generateName();
+    const localFile = fs.readFileSync(FILES.logo.path);
+    let file: File;
+
+    before(async () => {
+      const TEST_UNIVERSE_DOMAIN = isNullOrUndefined('TEST_UNIVERSE_DOMAIN');
+      const TEST_PROJECT_ID = isNullOrUndefined('TEST_UNIVERSE_PROJECT_ID');
+      const TEST_UNIVERSE_LOCATION = isNullOrUndefined(
+        'TEST_UNIVERSE_LOCATION'
+      );
+      const CREDENTIAL_PATH = isNullOrUndefined(
+        'TEST_UNIVERSE_DOMAIN_CREDENTIAL'
+      );
+      // Create a client with universe domain credentials
+      universeDomainStorage = new Storage({
+        projectId: TEST_PROJECT_ID,
+        keyFilename: CREDENTIAL_PATH,
+        universeDomain: TEST_UNIVERSE_DOMAIN,
+      });
+
+      const [bucket] = await universeDomainStorage.createBucket(bucketName, {
+        location: TEST_UNIVERSE_LOCATION,
+      });
+
+      file = bucket.file('LogoToSign.jpg');
+      fs.createReadStream(FILES.logo.path).pipe(file.createWriteStream());
+    });
+
+    after(async () => {
+      await deleteFileAsync(file);
+      await deleteBucketAsync(bucket);
+    });
+
+    it('should get bucket', async () => {
+      const [buckets] = await universeDomainStorage.getBuckets();
+      const getBucket = buckets.filter(item => item.name === bucketName);
+      assert.strictEqual(getBucket[0].name, bucketName);
+    });
+
+    it('should get files', async () => {
+      const fileName = await universeDomainStorage
+        .bucket(bucketName)
+        .file(file.name).name;
+      assert.strictEqual(fileName, file.name);
+    });
+
+    it('should create a signed read url', async () => {
+      const [signedReadUrl] = await file.getSignedUrl({
+        version: 'v2',
+        action: 'read',
+        expires: Date.now() + 5000,
+        virtualHostedStyle: true,
+      });
+
+      const res = await fetch(signedReadUrl);
+      const body = await res.text();
+      assert.strictEqual(body, localFile.toString());
     });
   });
 
@@ -4053,7 +4168,8 @@ describe('storage', () => {
         return false;
       }
     } catch (error) {
-      if (error.code === 404) {
+      const err = error as HTTPError;
+      if (err.code === 404) {
         return false;
       } else {
         throw error;
@@ -4095,5 +4211,13 @@ describe('storage', () => {
 
   function createFileWithContentPromise(content: string) {
     return bucket.file(`${generateName()}.txt`).save(content);
+  }
+
+  function isNullOrUndefined(envVarName: string) {
+    const value = process.env[envVarName];
+    if (value === undefined || value === null) {
+      throw new Error(`Please set the ${envVarName} environment variable.`);
+    }
+    return value;
   }
 });

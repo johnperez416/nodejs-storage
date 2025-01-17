@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {DecorateRequestOptions, util} from '@google-cloud/common';
-import * as assert from 'assert';
+import {DecorateRequestOptions, util} from '../src/nodejs-common/index.js';
+import assert from 'assert';
 import {describe, it, before, beforeEach} from 'mocha';
-import * as proxyquire from 'proxyquire';
+import proxyquire from 'proxyquire';
+import {IAMExceptionMessages} from '../src/iam.js';
 
 describe('storage/iam', () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -121,8 +122,8 @@ describe('storage/iam', () => {
   describe('setPolicy', () => {
     it('should throw an error if a policy is not supplied', () => {
       assert.throws(() => {
-        iam.setPolicy(util.noop);
-      }, /A policy object is required\./);
+        iam.setPolicy(util.noop), IAMExceptionMessages.POLICY_OBJECT_REQUIRED;
+      });
     });
 
     it('should make the correct API request', done => {
@@ -134,6 +135,7 @@ describe('storage/iam', () => {
         assert.deepStrictEqual(reqOpts, {
           method: 'PUT',
           uri: '/iam',
+          maxRetries: 0,
           json: Object.assign(
             {
               resourceId: iam.resourceId_,
@@ -170,8 +172,9 @@ describe('storage/iam', () => {
   describe('testPermissions', () => {
     it('should throw an error if permissions are missing', () => {
       assert.throws(() => {
-        iam.testPermissions(util.noop);
-      }, /Permissions are required\./);
+        iam.testPermissions(util.noop),
+          IAMExceptionMessages.PERMISSIONS_REQUIRED;
+      });
     });
 
     it('should make the correct API request', done => {
@@ -229,6 +232,28 @@ describe('storage/iam', () => {
           assert.deepStrictEqual(permissions, {
             'storage.bucket.list': false,
             'storage.bucket.consume': true,
+          });
+          assert.strictEqual(apiResp, apiResponse);
+
+          done();
+        }
+      );
+    });
+
+    it('should return false for supplied permissions if user has no permissions', done => {
+      const permissions = ['storage.bucket.list', 'storage.bucket.consume'];
+      const apiResponse = {permissions: undefined};
+
+      iam.request_ = (reqOpts: DecorateRequestOptions, callback: Function) => {
+        callback(null, apiResponse);
+      };
+      iam.testPermissions(
+        permissions,
+        (err: Error, permissions: Array<{}>, apiResp: {}) => {
+          assert.ifError(err);
+          assert.deepStrictEqual(permissions, {
+            'storage.bucket.list': false,
+            'storage.bucket.consume': false,
           });
           assert.strictEqual(apiResp, apiResponse);
 

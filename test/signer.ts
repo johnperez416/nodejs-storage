@@ -11,8 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-import * as assert from 'assert';
-import * as dateFormat from 'date-and-time';
+import assert from 'assert';
 import * as crypto from 'crypto';
 import * as sinon from 'sinon';
 import {describe, it, beforeEach, afterEach} from 'mocha';
@@ -27,8 +26,22 @@ import {
   PATH_STYLED_HOST,
   GetSignedUrlConfigInternal,
   Query,
-} from '../src/signer';
-import {encodeURI, qsStringify} from '../src/util';
+  SignerExceptionMessages,
+} from '../src/signer.js';
+import {encodeURI, formatAsUTCISO, qsStringify} from '../src/util.js';
+import {ExceptionMessages, Storage} from '../src/storage.js';
+import {OutgoingHttpHeaders} from 'http';
+import {GoogleAuth} from 'google-auth-library';
+
+interface SignedUrlArgs {
+  bucket: string;
+  method: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  contentMd5?: string;
+  contentType?: string;
+  extensionHeaders?: OutgoingHttpHeaders;
+  expiration?: number;
+  file: string;
+}
 
 describe('signer', () => {
   const BUCKET_NAME = 'bucket-name';
@@ -40,11 +53,11 @@ describe('signer', () => {
   afterEach(() => sandbox.restore());
 
   describe('URLSigner', () => {
-    let authClient: AuthClient;
+    let authClient: GoogleAuth | AuthClient;
     let bucket: BucketI;
     let file: FileI;
 
-    const NOW = new Date('2019-03-18T00:00:00Z');
+    const NOW = new Date('2019-03-18T00:00:00.999Z');
     let fakeTimers: sinon.SinonFakeTimers;
 
     beforeEach(() => (fakeTimers = sinon.useFakeTimers(NOW)));
@@ -66,7 +79,7 @@ describe('signer', () => {
       });
 
       it('should localize authClient', () => {
-        assert.strictEqual(signer['authClient'], authClient);
+        assert.strictEqual(signer['auth'], authClient);
       });
 
       it('should localize bucket', () => {
@@ -80,9 +93,12 @@ describe('signer', () => {
 
     describe('getSignedUrl', () => {
       let signer: URLSigner;
+      let storage: Storage;
       let CONFIG: SignerGetSignedUrlConfig;
+
       beforeEach(() => {
-        signer = new URLSigner(authClient, bucket, file);
+        storage = new Storage();
+        signer = new URLSigner(authClient, bucket, file, storage);
 
         CONFIG = {
           method: 'GET',
@@ -118,7 +134,7 @@ describe('signer', () => {
 
           await signer.getSignedUrl(CONFIG);
           assert(v2.calledOnce);
-          const v2arg = v2.getCall(0).args[0];
+          const v2arg = v2.getCall(0).args[0] as SignedUrlArgs;
           assert.strictEqual(v2arg.bucket, bucket.name);
           assert.strictEqual(v2arg.method, CONFIG.method);
           assert.strictEqual(v2arg.contentMd5, CONFIG.contentMd5);
@@ -146,7 +162,7 @@ describe('signer', () => {
 
           await signer.getSignedUrl(CONFIG);
           assert(v4.calledOnce);
-          const v4arg = v4.getCall(0).args[0];
+          const v4arg = v4.getCall(0).args[0] as SignedUrlArgs;
           assert.strictEqual(v4arg.bucket, bucket.name);
           assert.strictEqual(v4arg.method, CONFIG.method);
           assert.strictEqual(v4arg.contentMd5, CONFIG.contentMd5);
@@ -185,11 +201,7 @@ describe('signer', () => {
             expires: expiresNumber,
           });
           const blobToSign = authClientSign.getCall(0).args[0];
-          assert(
-            blobToSign.includes(
-              dateFormat.format(accessibleAt, 'YYYYMMDD[T]HHmmss[Z]', true)
-            )
-          );
+          assert(blobToSign.includes(formatAsUTCISO(accessibleAt, true)));
         });
 
         it('should throw if an expiration date from the before accessibleAt date is given', () => {
@@ -202,17 +214,14 @@ describe('signer', () => {
               method: 'GET',
               accessibleAt,
               expires,
-            });
-          }, /An expiration date cannot be before accessible date\./);
+            }),
+              SignerExceptionMessages.EXPIRATION_BEFORE_ACCESSIBLE_DATE;
+          });
         });
 
         describe('checkInputTypes', () => {
           const query = {
-            'X-Goog-Date': dateFormat.format(
-              new Date(accessibleAtNumber),
-              'YYYYMMDD[T]HHmmss[Z]',
-              true
-            ),
+            'X-Goog-Date': formatAsUTCISO(new Date(accessibleAtNumber), true),
           };
 
           it('should accept Date objects', async () => {
@@ -257,8 +266,9 @@ describe('signer', () => {
                 method: 'GET',
                 accessibleAt,
                 expires: expiresNumber,
-              });
-            }, /The accessible at date provided was invalid\./);
+              }),
+                SignerExceptionMessages.ACCESSIBLE_DATE_INVALID;
+            });
           });
         });
       });
@@ -278,7 +288,10 @@ describe('signer', () => {
           assert(parseExpires.calledOnceWith(CONFIG.expires));
           const expiresInSeconds = parseExpires.getCall(0).lastArg;
 
-          assert(v2.getCall(0).args[0].expiration, expiresInSeconds);
+          assert(
+            (v2.getCall(0).args[0] as SignedUrlArgs).expiration,
+            expiresInSeconds
+          );
         });
       });
 
@@ -303,6 +316,17 @@ describe('signer', () => {
         it('should pass virtual host to cname', async () => {
           CONFIG.virtualHostedStyle = true;
           const expectedCname = `https://${bucket.name}.storage.googleapis.com`;
+
+          await signer.getSignedUrl(CONFIG);
+          const v2arg = v2.getCall(0).args[0];
+          assert.strictEqual(v2arg.cname, expectedCname);
+        });
+
+        it('should use a universe domain with the virtual host', async () => {
+          storage.universeDomain = 'my-universe.com';
+
+          CONFIG.virtualHostedStyle = true;
+          const expectedCname = `https://${bucket.name}.storage.my-universe.com`;
 
           await signer.getSignedUrl(CONFIG);
           const v2arg = v2.getCall(0).args[0];
@@ -374,7 +398,7 @@ describe('signer', () => {
           .resolves({});
 
         await signer.getSignedUrl(CONFIG);
-        const v2arg = v2.getCall(0).args[0];
+        const v2arg = v2.getCall(0).args[0] as SignedUrlArgs;
         assert.strictEqual(v2arg.file, encoded);
         assert(signedUrl.includes(encoded));
       });
@@ -437,10 +461,13 @@ describe('signer', () => {
       });
 
       describe('blobToSign', () => {
-        let authClientSign: sinon.SinonStub<[string], Promise<string>>;
+        let authClientSign: sinon.SinonStub<
+          [blobToSign: string] & [data: string, endpoint?: string | undefined],
+          Promise<string>
+        >;
         beforeEach(() => {
           authClientSign = sandbox
-            .stub(authClient, 'sign')
+            .stub<GoogleAuth | AuthClient, 'sign'>(authClient, 'sign')
             .resolves('signature');
         });
 
@@ -449,6 +476,20 @@ describe('signer', () => {
 
           const blobToSign = authClientSign.getCall(0).args[0];
           assert(blobToSign.startsWith('GET'));
+        });
+
+        it('should sign using the `signingEndpoint` when provided', async () => {
+          const signingEndpoint = 'https://my-endpoint.com';
+
+          CONFIG = {
+            ...CONFIG,
+            signingEndpoint,
+          };
+
+          await signer['getSignedUrlV2'](CONFIG);
+
+          const endpoint = authClientSign.getCall(0).args[1];
+          assert.equal(endpoint, signingEndpoint);
         });
 
         it('should sign contentMd5 if given', async () => {
@@ -545,7 +586,7 @@ describe('signer', () => {
         signer = new URLSigner(authClient, bucket, file);
         CONFIG = {
           method: 'GET',
-          expiration: Math.floor((NOW.valueOf() + 2000) / 1000),
+          expiration: (NOW.valueOf() + 2000) / 1000,
           bucket: bucket.name,
         };
       });
@@ -560,6 +601,30 @@ describe('signer', () => {
           },
           {
             message: `Max allowed expiration is seven days (${SEVEN_DAYS} seconds).`,
+          }
+        );
+      });
+
+      it('should not throw with expiration of exactly 7 days', async () => {
+        const ACCESSIBLE_AT = NOW.valueOf();
+        const SEVEN_DAYS_IN_SECONDS = 7 * 24 * 60 * 60;
+        const SEVEN_DAYS_IN_MS = SEVEN_DAYS_IN_SECONDS * 1000;
+        await assert.doesNotReject(
+          async () => {
+            await signer.getSignedUrl({
+              method: 'GET',
+              expires: ACCESSIBLE_AT + SEVEN_DAYS_IN_MS,
+              accessibleAt: ACCESSIBLE_AT,
+              version: 'v4',
+            });
+          },
+          err => {
+            assert(err instanceof Error);
+            assert.strictEqual(
+              err.message,
+              `Max allowed expiration is seven days (${SEVEN_DAYS_IN_SECONDS.toString()} seconds).`
+            );
+            return true;
           }
         );
       });
@@ -657,10 +722,10 @@ describe('signer', () => {
             ...CONFIG,
           };
 
-          assert.throws(
-            () => signer['getSignedUrlV4'](CONFIG),
-            /The header X-Goog-Content-SHA256 must be a hexadecimal string./
-          );
+          assert.throws(() => {
+            signer['getSignedUrlV4'](CONFIG),
+              SignerExceptionMessages.X_GOOG_CONTENT_SHA256;
+          });
         });
       });
 
@@ -684,7 +749,7 @@ describe('signer', () => {
           const query = (await signer['getSignedUrlV4'](CONFIG)) as Query;
           const arg = getCanonicalQueryParams.getCall(0).args[0];
 
-          const datestamp = dateFormat.format(NOW, 'YYYYMMDD', true);
+          const datestamp = formatAsUTCISO(NOW);
           const credentialScope = `${datestamp}/auto/storage/goog4_request`;
           const EXPECTED_CREDENTIAL = `${CLIENT_EMAIL}/${credentialScope}`;
 
@@ -693,7 +758,7 @@ describe('signer', () => {
         });
 
         it('should populate X-Goog-Date', async () => {
-          const dateISO = dateFormat.format(NOW, 'YYYYMMDD[T]HHmmss[Z]', true);
+          const dateISO = formatAsUTCISO(NOW, true);
 
           const query = (await signer['getSignedUrlV4'](CONFIG)) as Query;
           const arg = getCanonicalQueryParams.getCall(0).args[0];
@@ -782,10 +847,29 @@ describe('signer', () => {
         assert(blobToSign.endsWith(canonicalRequestHash));
       });
 
+      it('should sign using the `signingEndpoint` when provided', async () => {
+        const signingEndpoint = 'https://my-endpoint.com';
+
+        sinon.stub(signer, 'getCanonicalRequest').returns('canonical-request');
+        const authClientSign = sinon
+          .stub(authClient, 'sign')
+          .resolves('signature');
+
+        CONFIG = {
+          ...CONFIG,
+          signingEndpoint,
+        };
+
+        await signer['getSignedUrlV4'](CONFIG);
+
+        const endpoint = authClientSign.getCall(0).args[1];
+        assert.equal(endpoint, signingEndpoint);
+      });
+
       it('should compose blobToSign', async () => {
-        const datestamp = dateFormat.format(NOW, 'YYYYMMDD', true);
+        const datestamp = formatAsUTCISO(NOW);
         const credentialScope = `${datestamp}/auto/storage/goog4_request`;
-        const dateISO = dateFormat.format(NOW, 'YYYYMMDD[T]HHmmss[Z]', true);
+        const dateISO = formatAsUTCISO(NOW, true);
 
         const authClientSign = sinon
           .stub(authClient, 'sign')
@@ -967,19 +1051,19 @@ describe('signer', () => {
 
       it('throws invalid date', () => {
         assert.throws(() => signer.parseExpires('2019-31-12T25:60:60Z'), {
-          message: 'The expiration date provided was invalid.',
+          message: ExceptionMessages.EXPIRATION_DATE_INVALID,
         });
       });
 
       it('throws if expiration is in the past', () => {
         assert.throws(() => signer.parseExpires(NOW.valueOf() - 1, NOW), {
-          message: 'An expiration date cannot be in the past.',
+          message: ExceptionMessages.EXPIRATION_DATE_PAST,
         });
       });
 
       it('returns expiration date in seconds', () => {
         const expires = signer.parseExpires(NOW);
-        assert.strictEqual(expires, Math.round(NOW.valueOf() / 1000));
+        assert.strictEqual(expires, Math.floor(NOW.valueOf() / 1000));
       });
     });
   });
