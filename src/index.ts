@@ -56,7 +56,35 @@
  * region_tag:storage_quickstart
  * Full quickstart example:
  */
+export {ApiError} from './nodejs-common/index.js';
 export {
+  BucketCallback,
+  BucketOptions,
+  CreateBucketQuery,
+  CreateBucketRequest,
+  CreateBucketResponse,
+  CreateHmacKeyCallback,
+  CreateHmacKeyOptions,
+  CreateHmacKeyResponse,
+  GetBucketsCallback,
+  GetBucketsRequest,
+  GetBucketsResponse,
+  GetHmacKeysCallback,
+  GetHmacKeysOptions,
+  GetHmacKeysResponse,
+  GetServiceAccountCallback,
+  GetServiceAccountOptions,
+  GetServiceAccountResponse,
+  HmacKeyResourceResponse,
+  IdempotencyStrategy,
+  PreconditionOptions,
+  RETRYABLE_ERR_FN_DEFAULT,
+  ServiceAccount,
+  Storage,
+  StorageOptions,
+} from './storage.js';
+export {
+  AclMetadata,
   AccessControlObject,
   AclOptions,
   AddAclCallback,
@@ -71,7 +99,7 @@ export {
   UpdateAclCallback,
   UpdateAclOptions,
   UpdateAclResponse,
-} from './acl';
+} from './acl.js';
 export {
   Bucket,
   BucketExistsCallback,
@@ -79,6 +107,7 @@ export {
   BucketExistsResponse,
   BucketLockCallback,
   BucketLockResponse,
+  BucketMetadata,
   CombineCallback,
   CombineOptions,
   CombineResponse,
@@ -117,6 +146,9 @@ export {
   GetNotificationsOptions,
   GetNotificationsResponse,
   Labels,
+  LifecycleAction,
+  LifecycleCondition,
+  LifecycleRule,
   MakeBucketPrivateCallback,
   MakeBucketPrivateOptions,
   MakeBucketPrivateResponse,
@@ -134,8 +166,9 @@ export {
   UploadCallback,
   UploadOptions,
   UploadResponse,
-} from './bucket';
-export {Channel, StopCallback} from './channel';
+} from './bucket.js';
+export * from './crc32c.js';
+export {Channel, StopCallback} from './channel.js';
 export {
   CopyCallback,
   CopyOptions,
@@ -156,6 +189,7 @@ export {
   FileExistsCallback,
   FileExistsOptions,
   FileExistsResponse,
+  FileMetadata,
   FileOptions,
   GetExpirationDateCallback,
   GetExpirationDateResponse,
@@ -165,9 +199,6 @@ export {
   GetFileMetadataResponse,
   GetFileOptions,
   GetFileResponse,
-  GetSignedPolicyCallback,
-  GetSignedPolicyOptions,
-  GetSignedPolicyResponse,
   GenerateSignedPostPolicyV2Callback,
   GenerateSignedPostPolicyV2Options,
   GenerateSignedPostPolicyV2Response,
@@ -198,7 +229,8 @@ export {
   SetStorageClassOptions,
   SetStorageClassResponse,
   SignedPostPolicyV4Output,
-} from './file';
+} from './file.js';
+export * from './hash-stream-validator.js';
 export {
   HmacKey,
   HmacKeyMetadata,
@@ -206,7 +238,7 @@ export {
   HmacKeyMetadataResponse,
   SetHmacKeyMetadata,
   SetHmacKeyMetadataOptions,
-} from './hmacKey';
+} from './hmacKey.js';
 export {
   GetPolicyCallback,
   GetPolicyOptions,
@@ -219,7 +251,7 @@ export {
   TestIamPermissionsCallback,
   TestIamPermissionsOptions,
   TestIamPermissionsResponse,
-} from './iam';
+} from './iam.js';
 export {
   DeleteNotificationCallback,
   DeleteNotificationOptions,
@@ -230,28 +262,7 @@ export {
   GetNotificationOptions,
   GetNotificationResponse,
   Notification,
-} from './notification';
-export {
-  BucketCallback,
-  BucketOptions,
-  CreateBucketQuery,
-  CreateBucketRequest,
-  CreateBucketResponse,
-  CreateHmacKeyCallback,
-  CreateHmacKeyOptions,
-  CreateHmacKeyResponse,
-  GetBucketsCallback,
-  GetBucketsRequest,
-  GetBucketsResponse,
-  GetHmacKeysCallback,
-  GetHmacKeysOptions,
-  GetHmacKeysResponse,
-  GetServiceAccountCallback,
-  GetServiceAccountOptions,
-  GetServiceAccountResponse,
-  HmacKeyResourceResponse,
-  ServiceAccount,
-  Storage,
-  StorageOptions,
-} from './storage';
-export {GetSignedUrlCallback, GetSignedUrlResponse} from './signer';
+  NotificationMetadata,
+} from './notification.js';
+export {GetSignedUrlCallback, GetSignedUrlResponse} from './signer.js';
+export * from './transfer-manager.js';

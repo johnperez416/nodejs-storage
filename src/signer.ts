@@ -13,18 +13,22 @@
 // limitations under the License.
 
 import * as crypto from 'crypto';
-import * as dateFormat from 'date-and-time';
 import * as http from 'http';
 import * as url from 'url';
-import {encodeURI, qsStringify, objectEntries} from './util';
+import {ExceptionMessages, Storage} from './storage.js';
+import {encodeURI, qsStringify, objectEntries, formatAsUTCISO} from './util.js';
+import {GoogleAuth} from 'google-auth-library';
 
-interface GetCredentialsResponse {
-  client_email?: string;
-}
+type GoogleAuthLike = Pick<GoogleAuth, 'getCredentials' | 'sign'>;
 
+/**
+ * @deprecated Use {@link GoogleAuth} instead
+ */
 export interface AuthClient {
   sign(blobToSign: string): Promise<string>;
-  getCredentials(): Promise<GetCredentialsResponse>;
+  getCredentials(): Promise<{
+    client_email?: string;
+  }>;
 }
 
 export interface BucketI {
@@ -50,6 +54,20 @@ export interface GetSignedUrlConfigInternal {
   contentType?: string;
   bucket: string;
   file?: string;
+  /**
+   * The host for the generated signed URL
+   *
+   * @example
+   * 'https://localhost:8080/'
+   */
+  host?: string | URL;
+  /**
+   * An endpoint for generating the signed URL
+   *
+   * @example
+   * 'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/'
+   */
+  signingEndpoint?: string | URL;
 }
 
 interface SignedUrlQuery {
@@ -75,6 +93,20 @@ export interface SignerGetSignedUrlConfig {
   queryParams?: Query;
   contentMd5?: string;
   contentType?: string;
+  /**
+   * The host for the generated signed URL
+   *
+   * @example
+   * 'https://localhost:8080/'
+   */
+  host?: string | URL;
+  /**
+   * An endpoint for generating the signed URL
+   *
+   * @example
+   * 'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/'
+   */
+  signingEndpoint?: string | URL;
 }
 
 export type SignerGetSignedUrlResponse = string;
@@ -87,29 +119,41 @@ export interface GetSignedUrlCallback {
 type ValueOf<T> = T[keyof T];
 type HeaderValue = ValueOf<http.OutgoingHttpHeaders>;
 
+export enum SignerExceptionMessages {
+  ACCESSIBLE_DATE_INVALID = 'The accessible at date provided was invalid.',
+  EXPIRATION_BEFORE_ACCESSIBLE_DATE = 'An expiration date cannot be before accessible date.',
+  X_GOOG_CONTENT_SHA256 = 'The header X-Goog-Content-SHA256 must be a hexadecimal string.',
+}
+
 /*
  * Default signing version for getSignedUrl is 'v2'.
  */
 const DEFAULT_SIGNING_VERSION = 'v2';
 
-const SEVEN_DAYS = 604800;
+const SEVEN_DAYS = 7 * 24 * 60 * 60;
 
 /**
  * @const {string}
- * @private
+ * @deprecated - unused
  */
 export const PATH_STYLED_HOST = 'https://storage.googleapis.com';
 
 export class URLSigner {
-  private authClient: AuthClient;
-  private bucket: BucketI;
-  private file?: FileI;
-
-  constructor(authClient: AuthClient, bucket: BucketI, file?: FileI) {
-    this.bucket = bucket;
-    this.file = file;
-    this.authClient = authClient;
-  }
+  constructor(
+    private auth: AuthClient | GoogleAuthLike,
+    private bucket: BucketI,
+    private file?: FileI,
+    /**
+     * A {@link Storage} object.
+     *
+     * @privateRemarks
+     *
+     * Technically this is a required field, however it would be a breaking change to
+     * move it before optional properties. In the next major we should refactor the
+     * constructor of this class to only accept a config object.
+     */
+    private storage: Storage = new Storage()
+  ) {}
 
   getSignedUrl(
     cfg: SignerGetSignedUrlConfig
@@ -119,7 +163,9 @@ export class URLSigner {
     const accessibleAtInSeconds = this.parseAccessibleAt(cfg.accessibleAt);
 
     if (expiresInSeconds < accessibleAtInSeconds) {
-      throw new Error('An expiration date cannot be before accessible date.');
+      throw new Error(
+        SignerExceptionMessages.EXPIRATION_BEFORE_ACCESSIBLE_DATE
+      );
     }
 
     let customHost: string | undefined;
@@ -129,7 +175,7 @@ export class URLSigner {
     if (cfg.cname) {
       customHost = cfg.cname;
     } else if (isVirtualHostedStyle) {
-      customHost = `https://${this.bucket.name}.storage.googleapis.com`;
+      customHost = `https://${this.bucket.name}.storage.${this.storage.universeDomain}`;
     }
 
     const secondsToMilliseconds = 1000;
@@ -161,7 +207,10 @@ export class URLSigner {
     return promise.then(query => {
       query = Object.assign(query, cfg.queryParams);
 
-      const signedUrl = new url.URL(config.cname || PATH_STYLED_HOST);
+      const signedUrl = new url.URL(
+        cfg.host?.toString() || config.cname || this.storage.apiEndpoint
+      );
+
       signedUrl.pathname = this.getResourcePath(
         !!config.cname,
         this.bucket.name,
@@ -194,10 +243,13 @@ export class URLSigner {
     ].join('\n');
 
     const sign = async () => {
-      const authClient = this.authClient;
+      const auth = this.auth;
       try {
-        const signature = await authClient.sign(blobToSign);
-        const credentials = await authClient.getCredentials();
+        const signature = await auth.sign(
+          blobToSign,
+          config.signingEndpoint?.toString()
+        );
+        const credentials = await auth.getCredentials();
 
         return {
           GoogleAccessId: credentials.client_email!,
@@ -205,8 +257,9 @@ export class URLSigner {
           Signature: signature,
         } as V2SignedUrlQuery;
       } catch (err) {
-        const signingErr = new SigningError(err.message);
-        signingErr.stack = err.stack;
+        const error = err as Error;
+        const signingErr = new SigningError(error.message);
+        signingErr.stack = error.stack;
         throw signingErr;
       }
     };
@@ -231,8 +284,10 @@ export class URLSigner {
     }
 
     const extensionHeaders = Object.assign({}, config.extensionHeaders);
-    const fqdn = new url.URL(config.cname || PATH_STYLED_HOST);
-    extensionHeaders.host = fqdn.host;
+    const fqdn = new url.URL(
+      config.host?.toString() || config.cname || this.storage.apiEndpoint
+    );
+    extensionHeaders.host = fqdn.hostname;
     if (config.contentMd5) {
       extensionHeaders['content-md5'] = config.contentMd5;
     }
@@ -247,9 +302,7 @@ export class URLSigner {
         typeof sha256Header !== 'string' ||
         !/[A-Fa-f0-9]{40}/.test(sha256Header)
       ) {
-        throw new Error(
-          'The header X-Goog-Content-SHA256 must be a hexadecimal string.'
-        );
+        throw new Error(SignerExceptionMessages.X_GOOG_CONTENT_SHA256);
       }
       contentSha256 = sha256Header;
     }
@@ -261,15 +314,14 @@ export class URLSigner {
 
     const extensionHeadersString = this.getCanonicalHeaders(extensionHeaders);
 
-    const datestamp = dateFormat.format(config.accessibleAt, 'YYYYMMDD', true);
+    const datestamp = formatAsUTCISO(config.accessibleAt);
     const credentialScope = `${datestamp}/auto/storage/goog4_request`;
 
     const sign = async () => {
-      const credentials = await this.authClient.getCredentials();
+      const credentials = await this.auth.getCredentials();
       const credential = `${credentials.client_email}/${credentialScope}`;
-      const dateISO = dateFormat.format(
+      const dateISO = formatAsUTCISO(
         config.accessibleAt ? config.accessibleAt : new Date(),
-        'YYYYMMDD[T]HHmmss[Z]',
         true
       );
       const queryParams: Query = {
@@ -306,15 +358,19 @@ export class URLSigner {
       ].join('\n');
 
       try {
-        const signature = await this.authClient.sign(blobToSign);
+        const signature = await this.auth.sign(
+          blobToSign,
+          config.signingEndpoint?.toString()
+        );
         const signatureHex = Buffer.from(signature, 'base64').toString('hex');
         const signedQuery: Query = Object.assign({}, queryParams, {
           'X-Goog-Signature': signatureHex,
         });
         return signedQuery;
       } catch (err) {
-        const signingErr = new SigningError(err.message);
-        signingErr.stack = err.stack;
+        const error = err as Error;
+        const signingErr = new SigningError(error.message);
+        signingErr.stack = error.stack;
         throw signingErr;
       }
     };
@@ -402,14 +458,14 @@ export class URLSigner {
     const expiresInMSeconds = new Date(expires).valueOf();
 
     if (isNaN(expiresInMSeconds)) {
-      throw new Error('The expiration date provided was invalid.');
+      throw new Error(ExceptionMessages.EXPIRATION_DATE_INVALID);
     }
 
     if (expiresInMSeconds < current.valueOf()) {
-      throw new Error('An expiration date cannot be in the past.');
+      throw new Error(ExceptionMessages.EXPIRATION_DATE_PAST);
     }
 
-    return Math.round(expiresInMSeconds / 1000); // The API expects seconds.
+    return Math.floor(expiresInMSeconds / 1000); // The API expects seconds.
   }
 
   parseAccessibleAt(accessibleAt?: string | number | Date): number {
@@ -418,7 +474,7 @@ export class URLSigner {
     ).valueOf();
 
     if (isNaN(accessibleAtInMSeconds)) {
-      throw new Error('The accessible at date provided was invalid.');
+      throw new Error(SignerExceptionMessages.ACCESSIBLE_DATE_INVALID);
     }
 
     return Math.floor(accessibleAtInMSeconds / 1000); // The API expects seconds.

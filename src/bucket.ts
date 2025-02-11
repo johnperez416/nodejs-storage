@@ -19,51 +19,55 @@ import {
   DeleteCallback,
   ExistsCallback,
   GetConfig,
-  Metadata,
-  ResponseBody,
+  MetadataCallback,
   ServiceObject,
+  SetMetadataResponse,
   util,
-} from '@google-cloud/common';
+} from './nodejs-common/index.js';
+import {RequestResponse} from './nodejs-common/service-object.js';
 import {paginator} from '@google-cloud/paginator';
 import {promisifyAll} from '@google-cloud/promisify';
-import arrify = require('arrify');
-import * as extend from 'extend';
 import * as fs from 'fs';
 import * as http from 'http';
-import * as mime from 'mime-types';
+import mime from 'mime';
 import * as path from 'path';
-import pLimit = require('p-limit');
+import pLimit from 'p-limit';
 import {promisify} from 'util';
-import retry = require('async-retry');
+import AsyncRetry from 'async-retry';
+import {convertObjKeysToSnakeCase} from './util.js';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const snakeize = require('snakeize');
-
-import {Acl} from './acl';
-import {Channel} from './channel';
+import {Acl, AclMetadata} from './acl.js';
+import {Channel} from './channel.js';
 import {
   File,
   FileOptions,
   CreateResumableUploadOptions,
   CreateWriteStreamOptions,
-} from './file';
-import {Iam} from './iam';
-import {Notification} from './notification';
+  FileMetadata,
+} from './file.js';
+import {Iam} from './iam.js';
+import {Notification, NotificationMetadata} from './notification.js';
 import {
   Storage,
   Cors,
   PreconditionOptions,
   IdempotencyStrategy,
   BucketOptions,
-} from './storage';
+} from './storage.js';
 import {
   GetSignedUrlResponse,
   GetSignedUrlCallback,
   SignerGetSignedUrlConfig,
   URLSigner,
   Query,
-} from './signer';
+} from './signer.js';
 import {Readable} from 'stream';
+import {CRC32CValidatorGenerator} from './crc32c.js';
+import {URL} from 'url';
+import {
+  BaseMetadata,
+  SetMetadataOptions,
+} from './nodejs-common/service-object.js';
 
 interface SourceObject {
   name: string;
@@ -77,15 +81,23 @@ interface CreateNotificationQuery {
 interface MetadataOptions {
   predefinedAcl: string;
   userProject?: string;
+  ifGenerationMatch?: number | string;
+  ifGenerationNotMatch?: number | string;
+  ifMetagenerationMatch?: number | string;
+  ifMetagenerationNotMatch?: number | string;
 }
 
-export type GetFilesResponse = [File[], {}, Metadata];
+export type GetFilesResponse = [
+  File[],
+  (GetFilesOptions | {}) & Partial<Pick<GetFilesOptions, 'pageToken'>>,
+  unknown,
+];
 export interface GetFilesCallback {
   (
     err: Error | null,
     files?: File[],
     nextQuery?: {},
-    apiResponse?: Metadata
+    apiResponse?: unknown
   ): void;
 }
 
@@ -99,17 +111,53 @@ interface WatchAllOptions {
   versions?: boolean;
 }
 
-export interface AddLifecycleRuleOptions {
+export interface AddLifecycleRuleOptions extends PreconditionOptions {
   append?: boolean;
 }
 
-export interface LifecycleRule {
-  action: {type: string; storageClass?: string} | string;
-  condition: {[key: string]: boolean | Date | number | string};
+export interface LifecycleAction {
+  type: 'Delete' | 'SetStorageClass' | 'AbortIncompleteMultipartUpload';
   storageClass?: string;
 }
+export interface LifecycleCondition {
+  age?: number;
+  createdBefore?: Date | string;
+  customTimeBefore?: Date | string;
+  daysSinceCustomTime?: number;
+  daysSinceNoncurrentTime?: number;
+  isLive?: boolean;
+  matchesPrefix?: string[];
+  matchesSuffix?: string[];
+  matchesStorageClass?: string[];
+  noncurrentTimeBefore?: Date | string;
+  numNewerVersions?: number;
+}
 
-export interface EnableLoggingOptions {
+export interface LifecycleRule {
+  action: LifecycleAction;
+  condition: LifecycleCondition;
+}
+
+export interface LifecycleCondition {
+  age?: number;
+  createdBefore?: Date | string;
+  customTimeBefore?: Date | string;
+  daysSinceCustomTime?: number;
+  daysSinceNoncurrentTime?: number;
+  isLive?: boolean;
+  matchesPrefix?: string[];
+  matchesSuffix?: string[];
+  matchesStorageClass?: string[];
+  noncurrentTimeBefore?: Date | string;
+  numNewerVersions?: number;
+}
+
+export interface LifecycleRule {
+  action: LifecycleAction;
+  condition: LifecycleCondition;
+}
+
+export interface EnableLoggingOptions extends PreconditionOptions {
   bucket?: string | Bucket;
   prefix: string;
 }
@@ -117,20 +165,19 @@ export interface EnableLoggingOptions {
 export interface GetFilesOptions {
   autoPaginate?: boolean;
   delimiter?: string;
-  /**
-   * @deprecated dirrectory is deprecated
-   * @internal
-   * */
-  directory?: string;
   endOffset?: string;
+  includeFoldersAsPrefixes?: boolean;
   includeTrailingDelimiter?: boolean;
   prefix?: string;
+  matchGlob?: string;
   maxApiCalls?: number;
   maxResults?: number;
   pageToken?: string;
+  softDeleted?: boolean;
   startOffset?: string;
   userProject?: string;
   versions?: boolean;
+  fields?: string;
 }
 
 export interface CombineOptions extends PreconditionOptions {
@@ -139,10 +186,10 @@ export interface CombineOptions extends PreconditionOptions {
 }
 
 export interface CombineCallback {
-  (err: Error | null, newFile: File | null, apiResponse: Metadata): void;
+  (err: Error | null, newFile: File | null, apiResponse: unknown): void;
 }
 
-export type CombineResponse = [File, Metadata];
+export type CombineResponse = [File, unknown];
 
 export interface CreateChannelConfig extends WatchAllOptions {
   address: string;
@@ -152,10 +199,10 @@ export interface CreateChannelOptions {
   userProject?: string;
 }
 
-export type CreateChannelResponse = [Channel, Metadata];
+export type CreateChannelResponse = [Channel, unknown];
 
 export interface CreateChannelCallback {
-  (err: Error | null, channel: Channel | null, apiResponse: Metadata): void;
+  (err: Error | null, channel: Channel | null, apiResponse: unknown): void;
 }
 
 export interface CreateNotificationOptions {
@@ -170,21 +217,21 @@ export interface CreateNotificationCallback {
   (
     err: Error | null,
     notification: Notification | null,
-    apiResponse: Metadata
+    apiResponse: unknown
   ): void;
 }
 
-export type CreateNotificationResponse = [Notification, Metadata];
+export type CreateNotificationResponse = [Notification, unknown];
 
 export interface DeleteBucketOptions {
   ignoreNotFound?: boolean;
   userProject?: string;
 }
 
-export type DeleteBucketResponse = [Metadata];
+export type DeleteBucketResponse = [unknown];
 
 export interface DeleteBucketCallback extends DeleteCallback {
-  (err: Error | null, apiResponse: Metadata): void;
+  (err: Error | null, apiResponse: unknown): void;
 }
 
 export interface DeleteFilesOptions
@@ -197,22 +244,27 @@ export interface DeleteFilesCallback {
   (err: Error | Error[] | null, apiResponse?: object): void;
 }
 
-export type DeleteLabelsResponse = [Metadata];
+export type DeleteLabelsResponse = [unknown];
 
 export type DeleteLabelsCallback = SetLabelsCallback;
 
-export type DisableRequesterPaysResponse = [Metadata];
+export type DeleteLabelsOptions = PreconditionOptions;
+
+export type DisableRequesterPaysOptions = PreconditionOptions;
+
+export type DisableRequesterPaysResponse = [unknown];
 
 export interface DisableRequesterPaysCallback {
   (err?: Error | null, apiResponse?: object): void;
 }
 
-export type EnableRequesterPaysResponse = [Metadata];
+export type EnableRequesterPaysResponse = [unknown];
 
 export interface EnableRequesterPaysCallback {
-  (err?: Error | null, apiResponse?: Metadata): void;
+  (err?: Error | null, apiResponse?: unknown): void;
 }
 
+export type EnableRequesterPaysOptions = PreconditionOptions;
 export interface BucketExistsOptions extends GetConfig {
   userProject?: string;
 }
@@ -225,29 +277,110 @@ export interface GetBucketOptions extends GetConfig {
   userProject?: string;
 }
 
-export type GetBucketResponse = [Bucket, Metadata];
+export type GetBucketResponse = [Bucket, unknown];
 
 export interface GetBucketCallback {
-  (err: ApiError | null, bucket: Bucket | null, apiResponse: Metadata): void;
+  (err: ApiError | null, bucket: Bucket | null, apiResponse: unknown): void;
 }
 
 export interface GetLabelsOptions {
   userProject?: string;
 }
 
-export type GetLabelsResponse = [Metadata];
+export type GetLabelsResponse = [unknown];
 
 export interface GetLabelsCallback {
   (err: Error | null, labels: object | null): void;
 }
 
-export type GetBucketMetadataResponse = [Metadata, Metadata];
+export interface RestoreOptions {
+  generation: string;
+  projection?: 'full' | 'noAcl';
+}
+export interface BucketMetadata extends BaseMetadata {
+  acl?: AclMetadata[] | null;
+  autoclass?: {
+    enabled?: boolean;
+    toggleTime?: string;
+    terminalStorageClass?: string;
+    terminalStorageClassUpdateTime?: string;
+  };
+  billing?: {
+    requesterPays?: boolean;
+  };
+  cors?: Cors[];
+  customPlacementConfig?: {
+    dataLocations?: string[];
+  };
+  defaultEventBasedHold?: boolean;
+  defaultObjectAcl?: AclMetadata[];
+  encryption?: {
+    defaultKmsKeyName?: string;
+  } | null;
+  hierarchicalNamespace?: {
+    enabled?: boolean;
+  };
+  iamConfiguration?: {
+    publicAccessPrevention?: string;
+    uniformBucketLevelAccess?: {
+      enabled?: boolean;
+      lockedTime?: string;
+    };
+  };
+  labels?: {
+    [key: string]: string | null;
+  };
+  lifecycle?: {
+    rule?: LifecycleRule[];
+  } | null;
+  location?: string;
+  locationType?: string;
+  logging?: {
+    logBucket?: string;
+    logObjectPrefix?: string;
+  };
+  generation?: string;
+  metageneration?: string;
+  name?: string;
+  objectRetention?: {
+    mode?: string;
+  };
+  owner?: {
+    entity?: string;
+    entityId?: string;
+  };
+  projectNumber?: string | number;
+  retentionPolicy?: {
+    effectiveTime?: string;
+    isLocked?: boolean;
+    retentionPeriod?: string | number;
+  } | null;
+  rpo?: string;
+  softDeleteTime?: string;
+  hardDeleteTime?: string;
+  softDeletePolicy?: {
+    retentionDurationSeconds?: string | number;
+    readonly effectiveTime?: string;
+  };
+  storageClass?: string;
+  timeCreated?: string;
+  updated?: string;
+  versioning?: {
+    enabled?: boolean;
+  };
+  website?: {
+    mainPageSuffix?: string;
+    notFoundPage?: string;
+  };
+}
+
+export type GetBucketMetadataResponse = [BucketMetadata, unknown];
 
 export interface GetBucketMetadataCallback {
   (
     err: ApiError | null,
-    metadata: Metadata | null,
-    apiResponse: Metadata
+    metadata: BucketMetadata | null,
+    apiResponse: unknown
   ): void;
 }
 
@@ -255,7 +388,8 @@ export interface GetBucketMetadataOptions {
   userProject?: string;
 }
 
-export interface GetBucketSignedUrlConfig {
+export interface GetBucketSignedUrlConfig
+  extends Pick<SignerGetSignedUrlConfig, 'host' | 'signingEndpoint'> {
   action: 'list';
   version?: 'v2' | 'v4';
   cname?: string;
@@ -282,17 +416,18 @@ export interface GetNotificationsCallback {
   (
     err: Error | null,
     notifications: Notification[] | null,
-    apiResponse: Metadata
+    apiResponse: unknown
   ): void;
 }
 
-export type GetNotificationsResponse = [Notification[], Metadata];
+export type GetNotificationsResponse = [Notification[], unknown];
 
 export interface MakeBucketPrivateOptions {
   includeFiles?: boolean;
   force?: boolean;
-  metadata?: Metadata;
+  metadata?: BucketMetadata;
   userProject?: string;
+  preconditionOpts?: PreconditionOptions;
 }
 
 interface MakeBucketPrivateRequest extends MakeBucketPrivateOptions {
@@ -316,37 +451,37 @@ export interface MakeBucketPublicCallback {
 
 export type MakeBucketPublicResponse = [File[]];
 
-export interface SetBucketMetadataOptions {
+export interface SetBucketMetadataOptions extends PreconditionOptions {
   userProject?: string;
 }
 
-export type SetBucketMetadataResponse = [Metadata];
+export type SetBucketMetadataResponse = [BucketMetadata];
 
 export interface SetBucketMetadataCallback {
-  (err?: Error | null, metadata?: Metadata): void;
+  (err?: Error | null, metadata?: BucketMetadata): void;
 }
 
 export interface BucketLockCallback {
-  (err?: Error | null, apiResponse?: Metadata): void;
+  (err?: Error | null, apiResponse?: unknown): void;
 }
 
-export type BucketLockResponse = [Metadata];
+export type BucketLockResponse = [unknown];
 
 export interface Labels {
   [key: string]: string;
 }
 
-export interface SetLabelsOptions {
+export interface SetLabelsOptions extends PreconditionOptions {
   userProject?: string;
 }
 
-export type SetLabelsResponse = [Metadata];
+export type SetLabelsResponse = [unknown];
 
 export interface SetLabelsCallback {
-  (err?: Error | null, metadata?: Metadata): void;
+  (err?: Error | null, metadata?: unknown): void;
 }
 
-export interface SetBucketStorageClassOptions {
+export interface SetBucketStorageClassOptions extends PreconditionOptions {
   userProject?: string;
 }
 
@@ -354,10 +489,10 @@ export interface SetBucketStorageClassCallback {
   (err?: Error | null): void;
 }
 
-export type UploadResponse = [File, Metadata];
+export type UploadResponse = [File, unknown];
 
 export interface UploadCallback {
-  (err: Error | null, file?: File | null, apiResponse?: Metadata): void;
+  (err: Error | null, file?: File | null, apiResponse?: unknown): void;
 }
 
 export interface UploadOptions
@@ -366,8 +501,6 @@ export interface UploadOptions
   destination?: string | File;
   encryptionKey?: string | Buffer;
   kmsKeyName?: string;
-  resumable?: boolean;
-  timeout?: number;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onUploadProgress?: (progressEvent: any) => void;
 }
@@ -385,15 +518,81 @@ interface MakeAllFilesPublicPrivateCallback {
 
 type MakeAllFilesPublicPrivateResponse = [File[]];
 
-/**
- * The size of a file (in bytes) must be greater than this number to
- * automatically trigger a resumable upload.
- *
- * @const {number}
- * @private
- */
-const RESUMABLE_THRESHOLD = 5000000;
+export enum BucketExceptionMessages {
+  PROVIDE_SOURCE_FILE = 'You must provide at least one source file.',
+  DESTINATION_FILE_NOT_SPECIFIED = 'A destination file must be specified.',
+  CHANNEL_ID_REQUIRED = 'An ID is required to create a channel.',
+  TOPIC_NAME_REQUIRED = 'A valid topic name is required.',
+  CONFIGURATION_OBJECT_PREFIX_REQUIRED = 'A configuration object with a prefix is required.',
+  SPECIFY_FILE_NAME = 'A file name must be specified.',
+  METAGENERATION_NOT_PROVIDED = 'A metageneration must be provided.',
+  SUPPLY_NOTIFICATION_ID = 'You must supply a notification ID.',
+}
 
+/**
+ * @callback Crc32cGeneratorToStringCallback
+ * A method returning the CRC32C as a base64-encoded string.
+ *
+ * @returns {string}
+ *
+ * @example
+ * Hashing the string 'data' should return 'rth90Q=='
+ *
+ * ```js
+ * const buffer = Buffer.from('data');
+ * crc32c.update(buffer);
+ * crc32c.toString(); // 'rth90Q=='
+ * ```
+ **/
+/**
+ * @callback Crc32cGeneratorValidateCallback
+ * A method validating a base64-encoded CRC32C string.
+ *
+ * @param {string} [value] base64-encoded CRC32C string to validate
+ * @returns {boolean}
+ *
+ * @example
+ * Should return `true` if the value matches, `false` otherwise
+ *
+ * ```js
+ * const buffer = Buffer.from('data');
+ * crc32c.update(buffer);
+ * crc32c.validate('DkjKuA=='); // false
+ * crc32c.validate('rth90Q=='); // true
+ * ```
+ **/
+/**
+ * @callback Crc32cGeneratorUpdateCallback
+ * A method for passing `Buffer`s for CRC32C generation.
+ *
+ * @param {Buffer} [data] data to update CRC32C value with
+ * @returns {undefined}
+ *
+ * @example
+ * Hashing buffers from 'some ' and 'text\n'
+ *
+ * ```js
+ * const buffer1 = Buffer.from('some ');
+ * crc32c.update(buffer1);
+ *
+ * const buffer2 = Buffer.from('text\n');
+ * crc32c.update(buffer2);
+ *
+ * crc32c.toString(); // 'DkjKuA=='
+ * ```
+ **/
+/**
+ * @typedef {object} CRC32CValidator
+ * @property {Crc32cGeneratorToStringCallback}
+ * @property {Crc32cGeneratorValidateCallback}
+ * @property {Crc32cGeneratorUpdateCallback}
+ */
+/**
+ * A function that generates a CRC32C Validator. Defaults to {@link CRC32C}
+ *
+ * @name Bucket#crc32cGenerator
+ * @type {CRC32CValidator}
+ */
 /**
  * Get and set IAM policies for your bucket.
  *
@@ -607,8 +806,7 @@ const RESUMABLE_THRESHOLD = 5000000;
  * const bucket = storage.bucket('albums');
  * ```
  */
-class Bucket extends ServiceObject {
-  metadata: Metadata;
+class Bucket extends ServiceObject<Bucket, BucketMetadata> {
   name: string;
 
   /**
@@ -628,12 +826,17 @@ class Bucket extends ServiceObject {
 
   acl: Acl;
   iam: Iam;
+  crc32cGenerator: CRC32CValidatorGenerator;
 
-  getFilesStream: (query?: GetFilesOptions) => Readable;
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  getFilesStream(query?: GetFilesOptions): Readable {
+    // placeholder body, overwritten in constructor
+    return new Readable();
+  }
   signer?: URLSigner;
 
   private instanceRetryValue?: boolean;
-  private instancePreconditionOpts?: PreconditionOptions;
+  instancePreconditionOpts?: PreconditionOptions;
 
   constructor(storage: Storage, name: string, options?: BucketOptions) {
     options = options || {};
@@ -643,10 +846,10 @@ class Bucket extends ServiceObject {
 
     const requestQueryObject: {
       userProject?: string;
-      ifGenerationMatch?: number;
-      ifGenerationNotMatch?: number;
-      ifMetagenerationMatch?: number;
-      ifMetagenerationNotMatch?: number;
+      ifGenerationMatch?: number | string;
+      ifGenerationNotMatch?: number | string;
+      ifMetagenerationMatch?: number | string;
+      ifMetagenerationNotMatch?: number | string;
     } = {};
 
     if (options?.preconditionOpts?.ifGenerationMatch) {
@@ -706,7 +909,7 @@ class Bucket extends ServiceObject {
         },
       },
       /**
-       * @typedef {object} DeleteBucketOptions Configuration options.
+       * IamDeleteBucketOptions Configuration options.
        * @property {boolean} [ignoreNotFound = false] Ignore an error if
        *     the bucket does not exist.
        * @property {string} [userProject] The ID of the project which will be
@@ -1036,6 +1239,9 @@ class Bucket extends ServiceObject {
       pathPrefix: '/defaultObjectAcl',
     });
 
+    this.crc32cGenerator =
+      options.crc32cGenerator || this.storage.crc32cGenerator;
+
     this.iam = new Iam(this);
 
     this.getFilesStream = paginator.streamify('getFiles');
@@ -1044,17 +1250,38 @@ class Bucket extends ServiceObject {
     this.instancePreconditionOpts = options?.preconditionOpts;
   }
 
+  /**
+   * The bucket's Cloud Storage URI (`gs://`)
+   *
+   * @example
+   * ```ts
+   * const {Storage} = require('@google-cloud/storage');
+   * const storage = new Storage();
+   * const bucket = storage.bucket('my-bucket');
+   *
+   * // `gs://my-bucket`
+   * const href = bucket.cloudStorageURI.href;
+   * ```
+   */
+  get cloudStorageURI(): URL {
+    const uri = new URL('gs://');
+
+    uri.host = this.name;
+
+    return uri;
+  }
+
   addLifecycleRule(
-    rule: LifecycleRule,
+    rule: LifecycleRule | LifecycleRule[],
     options?: AddLifecycleRuleOptions
   ): Promise<SetBucketMetadataResponse>;
   addLifecycleRule(
-    rule: LifecycleRule,
+    rule: LifecycleRule | LifecycleRule[],
     options: AddLifecycleRuleOptions,
     callback: SetBucketMetadataCallback
   ): void;
   addLifecycleRule(
-    rule: LifecycleRule,
+    rule: LifecycleRule | LifecycleRule[],
     callback: SetBucketMetadataCallback
   ): void;
   /**
@@ -1067,11 +1294,11 @@ class Bucket extends ServiceObject {
    * @typedef {object} LifecycleRule The new lifecycle rule to be added to objects
    *     in this bucket.
    * @property {string|object} action The action to be taken upon matching of
-   *     all the conditions 'delete' or 'setStorageClass'.
+   *     all the conditions 'delete', 'setStorageClass', or 'AbortIncompleteMultipartUpload'.
    *     **Note**: For configuring a raw-formatted rule object to be passed as `action`
    *               please refer to the [examples]{@link https://cloud.google.com/storage/docs/managing-lifecycles#configexamples}.
    * @property {object} condition Condition a bucket must meet before the
-   *     action occurson the bucket. Refer to followitn supported [conditions]{@link https://cloud.google.com/storage/docs/lifecycle#conditions}.
+   *     action occurs on the bucket. Refer to following supported [conditions]{@link https://cloud.google.com/storage/docs/lifecycle#conditions}.
    * @property {string} [storageClass] When using the `setStorageClass`
    *     action, provide this option to dictate which storage class the object
    *     should update to. Please see
@@ -1084,13 +1311,17 @@ class Bucket extends ServiceObject {
    * will be included to the existing policy. To replace all existing rules,
    * supply the `options` argument, setting `append` to `false`.
    *
+   * To add multiple rules, pass a list to the `rule` parameter. Calling this
+   * function multiple times asynchronously does not guarantee that all rules
+   * are added correctly.
+   *
    * See {@link https://cloud.google.com/storage/docs/lifecycle| Object Lifecycle Management}
    * See {@link https://cloud.google.com/storage/docs/json_api/v1/buckets/patch| Buckets: patch API Documentation}
    *
-   * @param {LifecycleRule} rule The new lifecycle rule to be added to objects
+   * @param {LifecycleRule|LifecycleRule[]} rule The new lifecycle rule or rules to be added to objects
    *     in this bucket.
    * @param {string|object} rule.action The action to be taken upon matching of
-   *     all the conditions 'delete' or 'setStorageClass'.
+   *     all the conditions 'delete', 'setStorageClass', or 'AbortIncompleteMultipartUpload'.
    *     **Note**: For configuring a raw-formatted rule object to be passed as `action`
    *               please refer to the [examples]{@link https://cloud.google.com/storage/docs/managing-lifecycles#configexamples}.
    * @param {object} rule.condition Condition a bucket must meet before the
@@ -1222,11 +1453,11 @@ class Bucket extends ServiceObject {
    * ```
    */
   addLifecycleRule(
-    rule: LifecycleRule,
+    rule: LifecycleRule | LifecycleRule[],
     optionsOrCallback?: AddLifecycleRuleOptions | SetBucketMetadataCallback,
     callback?: SetBucketMetadataCallback
   ): Promise<SetBucketMetadataResponse> | void {
-    let options;
+    let options: AddLifecycleRuleOptions = {};
 
     if (typeof optionsOrCallback === 'function') {
       callback = optionsOrCallback;
@@ -1236,72 +1467,51 @@ class Bucket extends ServiceObject {
 
     options = options || {};
 
-    const newLifecycleRules = arrify(rule).map(rule => {
-      if (typeof rule.action === 'object') {
-        // This is a raw-formatted rule object, the way the API expects.
-        // Just pass it through as-is.
-        return rule;
+    const rules = Array.isArray(rule) ? rule : [rule];
+    for (const curRule of rules) {
+      if (curRule.condition.createdBefore instanceof Date) {
+        curRule.condition.createdBefore = curRule.condition.createdBefore
+          .toISOString()
+          .replace(/T.+$/, '');
       }
-
-      const apiFormattedRule = {} as LifecycleRule;
-
-      apiFormattedRule.condition = {};
-      apiFormattedRule.action = {
-        type: rule.action.charAt(0).toUpperCase() + rule.action.slice(1),
-      };
-
-      if (rule.storageClass) {
-        apiFormattedRule.action.storageClass = rule.storageClass;
+      if (curRule.condition.customTimeBefore instanceof Date) {
+        curRule.condition.customTimeBefore = curRule.condition.customTimeBefore
+          .toISOString()
+          .replace(/T.+$/, '');
       }
-
-      for (const condition in rule.condition) {
-        if (rule.condition[condition] instanceof Date) {
-          apiFormattedRule.condition[condition] = (
-            rule.condition[condition] as Date
-          )
+      if (curRule.condition.noncurrentTimeBefore instanceof Date) {
+        curRule.condition.noncurrentTimeBefore =
+          curRule.condition.noncurrentTimeBefore
             .toISOString()
             .replace(/T.+$/, '');
-        } else {
-          apiFormattedRule.condition[condition] = rule.condition[condition];
-        }
       }
-
-      return apiFormattedRule;
-    });
-
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    }
 
     if (options.append === false) {
-      this.setMetadata({lifecycle: {rule: newLifecycleRules}}, callback);
-      this.storage.retryOptions.autoRetry = this.instanceRetryValue;
+      this.setMetadata({lifecycle: {rule: rules}}, options, callback!);
       return;
     }
 
     // The default behavior appends the previously-defined lifecycle rules with
     // the new ones just passed in by the user.
-    this.getMetadata((err: ApiError | null, metadata: Metadata) => {
+    this.getMetadata((err: ApiError | null, metadata: BucketMetadata) => {
       if (err) {
         callback!(err);
         return;
       }
 
-      const currentLifecycleRules = arrify(
-        metadata.lifecycle && metadata.lifecycle.rule
-      );
+      const currentLifecycleRules = Array.isArray(metadata.lifecycle?.rule)
+        ? metadata.lifecycle?.rule
+        : [];
 
       this.setMetadata(
         {
-          lifecycle: {
-            rule: currentLifecycleRules.concat(newLifecycleRules),
-          },
+          lifecycle: {rule: currentLifecycleRules!.concat(rules)},
         },
+        options as AddLifecycleRuleOptions,
         callback!
       );
     });
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
   combine(
@@ -1397,11 +1607,11 @@ class Bucket extends ServiceObject {
     callback?: CombineCallback
   ): Promise<CombineResponse> | void {
     if (!Array.isArray(sources) || sources.length === 0) {
-      throw new Error('You must provide at least one source file.');
+      throw new Error(BucketExceptionMessages.PROVIDE_SOURCE_FILE);
     }
 
     if (!destination) {
-      throw new Error('A destination file must be specified.');
+      throw new Error(BucketExceptionMessages.DESTINATION_FILE_NOT_SPECIFIED);
     }
 
     let options: CombineOptions = {};
@@ -1410,6 +1620,12 @@ class Bucket extends ServiceObject {
     } else if (optionsOrCallback) {
       options = optionsOrCallback;
     }
+
+    this.disableAutoRetryConditionallyIdempotent_(
+      this.methods.setMetadata, // Not relevant but param is required
+      AvailableServiceObjectMethods.setMetadata, // Same as above
+      options
+    );
 
     const convertToFile = (file: string | File): File => {
       if (file instanceof File) {
@@ -1424,7 +1640,8 @@ class Bucket extends ServiceObject {
     callback = callback || util.noop;
 
     if (!destinationFile.metadata.contentType) {
-      const destinationContentType = mime.contentType(destinationFile.name);
+      const destinationContentType =
+        mime.getType(destinationFile.name) || undefined;
 
       if (destinationContentType) {
         destinationFile.metadata.contentType = destinationContentType;
@@ -1432,19 +1649,21 @@ class Bucket extends ServiceObject {
     }
 
     let maxRetries = this.storage.retryOptions.maxRetries;
-    (sources as File[]).forEach(source => {
-      if (
-        (source?.instancePreconditionOpts?.ifGenerationMatch === undefined &&
-          this.storage.retryOptions.idempotencyStrategy ===
-            IdempotencyStrategy.RetryConditional) ||
+    if (
+      (destinationFile?.instancePreconditionOpts?.ifGenerationMatch ===
+        undefined &&
+        options.ifGenerationMatch === undefined &&
         this.storage.retryOptions.idempotencyStrategy ===
-          IdempotencyStrategy.RetryNever
-      ) {
-        maxRetries = 0;
-      }
-    });
+          IdempotencyStrategy.RetryConditional) ||
+      this.storage.retryOptions.idempotencyStrategy ===
+        IdempotencyStrategy.RetryNever
+    ) {
+      maxRetries = 0;
+    }
 
-    Object.assign(options, this.instancePreconditionOpts, options);
+    if (options.ifGenerationMatch === undefined) {
+      Object.assign(options, destinationFile.instancePreconditionOpts, options);
+    }
 
     // Make the request from the destination File object.
     destinationFile.request(
@@ -1455,19 +1674,17 @@ class Bucket extends ServiceObject {
         json: {
           destination: {
             contentType: destinationFile.metadata.contentType,
+            contentEncoding: destinationFile.metadata.contentEncoding,
           },
           sourceObjects: (sources as File[]).map(source => {
             const sourceObject = {
               name: source.name,
             } as SourceObject;
 
-            if (
-              source?.metadata?.generation ||
-              source?.instancePreconditionOpts?.ifGenerationMatch
-            ) {
-              sourceObject.generation =
-                source?.metadata?.generation ||
-                source?.instancePreconditionOpts?.ifGenerationMatch;
+            if (source.metadata && source.metadata.generation) {
+              sourceObject.generation = parseInt(
+                source.metadata.generation.toString()
+              );
             }
 
             return sourceObject;
@@ -1476,6 +1693,7 @@ class Bucket extends ServiceObject {
         qs: options,
       },
       (err, resp) => {
+        this.storage.retryOptions.autoRetry = this.instanceRetryValue;
         if (err) {
           callback!(err, null, resp);
           return;
@@ -1600,11 +1818,7 @@ class Bucket extends ServiceObject {
     callback?: CreateChannelCallback
   ): Promise<CreateChannelResponse> | void {
     if (typeof id !== 'string') {
-      throw new Error('An ID is required to create a channel.');
-    }
-
-    if (typeof config.address !== 'string') {
-      throw new Error('An address is required to create a channel.');
+      throw new Error(BucketExceptionMessages.CHANNEL_ID_REQUIRED);
     }
 
     let options: CreateChannelOptions = {};
@@ -1776,7 +1990,7 @@ class Bucket extends ServiceObject {
     }
 
     if (typeof topic !== 'string') {
-      throw new Error('A valid topic name is required.');
+      throw new Error(BucketExceptionMessages.TOPIC_NAME_REQUIRED);
     }
 
     const body = Object.assign({topic}, options);
@@ -1785,7 +1999,7 @@ class Bucket extends ServiceObject {
       body.topic = 'projects/{{projectId}}/topics/' + body.topic;
     }
 
-    body.topic = '//pubsub.googleapis.com/' + body.topic;
+    body.topic = `//pubsub.${this.storage.universeDomain}/` + body.topic;
 
     if (!body.payloadFormat) {
       body.payloadFormat = 'JSON_API_V1';
@@ -1802,7 +2016,7 @@ class Bucket extends ServiceObject {
       {
         method: 'POST',
         uri: '/notificationConfigs',
-        json: snakeize(body),
+        json: convertObjKeysToSnakeCase(body),
         qs: query,
         maxRetries: 0, //explicitly set this value since this is a non-idempotent function
       },
@@ -1847,6 +2061,9 @@ class Bucket extends ServiceObject {
    * breaks the loop and will execute the provided callback with it. Specify
    * `{ force: true }` to suppress the errors until all files have had a chance
    * to be processed.
+   *
+   * File preconditions cannot be passed to this function. It will not retry unless
+   * the idempotency strategy is set to retry always.
    *
    * The `query` object passed as the first argument will also be passed to
    * {@link Bucket#getFiles}.
@@ -1913,6 +2130,7 @@ class Bucket extends ServiceObject {
     }
 
     const MAX_PARALLEL_LIMIT = 10;
+    const MAX_QUEUE_SIZE = 1000;
     const errors = [] as Error[];
 
     const deleteFile = (file: File) => {
@@ -1924,35 +2142,66 @@ class Bucket extends ServiceObject {
       });
     };
 
-    this.getFiles(query)
-      .then(([files]) => {
+    (async () => {
+      try {
+        let promises = [];
         const limit = pLimit(MAX_PARALLEL_LIMIT);
-        const promises = files!.map(file => {
-          return limit(() => deleteFile(file));
-        });
-        return Promise.all(promises);
-      })
-      .then(() => callback!(errors.length > 0 ? errors : null), callback!);
+        const filesStream = this.getFilesStream(query);
+
+        for await (const curFile of filesStream) {
+          if (promises.length >= MAX_QUEUE_SIZE) {
+            await Promise.all(promises);
+            promises = [];
+          }
+          promises.push(
+            limit(() => deleteFile(curFile)).catch(e => {
+              filesStream.destroy();
+              throw e;
+            })
+          );
+        }
+
+        await Promise.all(promises);
+        callback!(errors.length > 0 ? errors : null);
+      } catch (e) {
+        callback!(e as Error);
+        return;
+      }
+    })();
   }
 
   deleteLabels(labels?: string | string[]): Promise<DeleteLabelsResponse>;
+  deleteLabels(options: DeleteLabelsOptions): Promise<DeleteLabelsResponse>;
   deleteLabels(callback: DeleteLabelsCallback): void;
+  deleteLabels(
+    labels: string | string[],
+    options: DeleteLabelsOptions
+  ): Promise<DeleteLabelsResponse>;
   deleteLabels(labels: string | string[], callback: DeleteLabelsCallback): void;
+  deleteLabels(
+    labels: string | string[],
+    options: DeleteLabelsOptions,
+    callback: DeleteLabelsCallback
+  ): void;
   /**
+   * @deprecated
    * @typedef {array} DeleteLabelsResponse
    * @property {object} 0 The full API response.
    */
   /**
+   * @deprecated
    * @callback DeleteLabelsCallback
    * @param {?Error} err Request error, if any.
    * @param {object} metadata Bucket's metadata.
    */
   /**
+   * @deprecated Use setMetadata directly
    * Delete one or more labels from this bucket.
    *
    * @param {string|string[]} [labels] The labels to delete. If no labels are
    *     provided, all of the labels are removed.
    * @param {DeleteLabelsCallback} [callback] Callback function.
+   * @param {DeleteLabelsOptions} [options] Options, including precondition options
    * @returns {Promise<DeleteLabelsResponse>}
    *
    * @example
@@ -1988,14 +2237,31 @@ class Bucket extends ServiceObject {
    * ```
    */
   deleteLabels(
-    labelsOrCallback?: string | string[] | DeleteLabelsCallback,
+    labelsOrCallbackOrOptions?:
+      | string
+      | string[]
+      | DeleteLabelsCallback
+      | DeleteLabelsOptions,
+    optionsOrCallback?: DeleteLabelsCallback | DeleteLabelsOptions,
     callback?: DeleteLabelsCallback
   ): Promise<DeleteLabelsResponse> | void {
     let labels = new Array<string>();
-    if (typeof labelsOrCallback === 'function') {
-      callback = labelsOrCallback;
-    } else if (labelsOrCallback) {
-      labels = arrify(labelsOrCallback);
+    let options: DeleteLabelsOptions = {};
+
+    if (typeof labelsOrCallbackOrOptions === 'function') {
+      callback = labelsOrCallbackOrOptions;
+    } else if (typeof labelsOrCallbackOrOptions === 'string') {
+      labels = [labelsOrCallbackOrOptions];
+    } else if (Array.isArray(labelsOrCallbackOrOptions)) {
+      labels = labelsOrCallbackOrOptions;
+    } else if (labelsOrCallbackOrOptions) {
+      options = labelsOrCallbackOrOptions;
+    }
+
+    if (typeof optionsOrCallback === 'function') {
+      callback = optionsOrCallback;
+    } else if (optionsOrCallback) {
+      options = optionsOrCallback;
     }
 
     const deleteLabels = (labels: string[]) => {
@@ -2004,7 +2270,11 @@ class Bucket extends ServiceObject {
         return nullLabelMap;
       }, {});
 
-      this.setLabels(nullLabelMap, callback!);
+      if (options?.ifMetagenerationMatch !== undefined) {
+        this.setLabels(nullLabelMap, options, callback!);
+      } else {
+        this.setLabels(nullLabelMap, callback!);
+      }
     };
 
     if (labels.length === 0) {
@@ -2020,8 +2290,14 @@ class Bucket extends ServiceObject {
     }
   }
 
-  disableRequesterPays(): Promise<DisableRequesterPaysResponse>;
+  disableRequesterPays(
+    options?: DisableRequesterPaysOptions
+  ): Promise<DisableRequesterPaysResponse>;
   disableRequesterPays(callback: DisableRequesterPaysCallback): void;
+  disableRequesterPays(
+    options: DisableRequesterPaysOptions,
+    callback: DisableRequesterPaysCallback
+  ): void;
   /**
    * @typedef {array} DisableRequesterPaysResponse
    * @property {object} 0 The full API response.
@@ -2042,6 +2318,7 @@ class Bucket extends ServiceObject {
    * Disable `requesterPays` functionality from this bucket.
    *
    * @param {DisableRequesterPaysCallback} [callback] Callback function.
+   * @param {DisableRequesterPaysOptions} [options] Options, including precondition options
    * @returns {Promise<DisableRequesterPaysCallback>}
    *
    * @example
@@ -2069,21 +2346,27 @@ class Bucket extends ServiceObject {
    * Example of disabling requester pays:
    */
   disableRequesterPays(
+    optionsOrCallback?:
+      | DisableRequesterPaysOptions
+      | DisableRequesterPaysCallback,
     callback?: DisableRequesterPaysCallback
   ): Promise<DisableRequesterPaysResponse> | void {
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    let options: DisableRequesterPaysOptions = {};
+    if (typeof optionsOrCallback === 'function') {
+      callback = optionsOrCallback;
+    } else if (optionsOrCallback) {
+      options = optionsOrCallback;
+    }
+
     this.setMetadata(
       {
         billing: {
           requesterPays: false,
         },
       },
-      callback || util.noop
+      options,
+      callback!
     );
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
   enableLogging(
@@ -2158,16 +2441,26 @@ class Bucket extends ServiceObject {
       typeof config === 'function' ||
       typeof config.prefix === 'undefined'
     ) {
-      throw new Error('A configuration object with a prefix is required.');
+      throw new Error(
+        BucketExceptionMessages.CONFIGURATION_OBJECT_PREFIX_REQUIRED
+      );
     }
 
-    const logBucket = config.bucket
-      ? (config.bucket as Bucket).id || config.bucket
-      : this.id;
+    let logBucket = this.id;
+    if (config.bucket && config.bucket instanceof Bucket) {
+      logBucket = config.bucket.id;
+    } else if (config.bucket && typeof config.bucket === 'string') {
+      logBucket = config.bucket;
+    }
 
+    const options: PreconditionOptions = {};
+    if (config?.ifMetagenerationMatch) {
+      options.ifMetagenerationMatch = config.ifMetagenerationMatch;
+    }
+    if (config?.ifMetagenerationNotMatch) {
+      options.ifMetagenerationNotMatch = config.ifMetagenerationNotMatch;
+    }
     (async () => {
-      let setMetadataResponse;
-
       try {
         const [policy] = await this.iam.getPolicy();
         policy.bindings.push({
@@ -2175,29 +2468,32 @@ class Bucket extends ServiceObject {
           role: 'roles/storage.objectCreator',
         });
         await this.iam.setPolicy(policy);
-        this.disableAutoRetryConditionallyIdempotent_(
-          this.methods.setMetadata,
-          AvailableServiceObjectMethods.setMetadata
-        );
-        [setMetadataResponse] = await this.setMetadata({
-          logging: {
-            logBucket,
-            logObjectPrefix: config.prefix,
+        this.setMetadata(
+          {
+            logging: {
+              logBucket,
+              logObjectPrefix: config.prefix,
+            },
           },
-        });
+          options,
+          callback!
+        );
       } catch (e) {
-        callback!(e);
+        callback!(e as Error);
         return;
-      } finally {
-        this.storage.retryOptions.autoRetry = this.instanceRetryValue;
       }
-
-      callback!(null, setMetadataResponse);
     })();
   }
 
-  enableRequesterPays(): Promise<EnableRequesterPaysResponse>;
+  enableRequesterPays(
+    options?: EnableRequesterPaysOptions
+  ): Promise<EnableRequesterPaysResponse>;
   enableRequesterPays(callback: EnableRequesterPaysCallback): void;
+  enableRequesterPays(
+    options: EnableRequesterPaysOptions,
+    callback: EnableRequesterPaysCallback
+  ): void;
+
   /**
    * @typedef {array} EnableRequesterPaysResponse
    * @property {object} 0 The full API response.
@@ -2219,7 +2515,8 @@ class Bucket extends ServiceObject {
    * bucket owner, to have the requesting user assume the charges for the access
    * to your bucket and its contents.
    *
-   * @param {EnableRequesterPaysCallback} [callback] Callback function.
+   * @param {EnableRequesterPaysCallback | EnableRequesterPaysOptions} [optionsOrCallback]
+   * Callback function or precondition options.
    * @returns {Promise<EnableRequesterPaysResponse>}
    *
    * @example
@@ -2247,21 +2544,27 @@ class Bucket extends ServiceObject {
    * Example of enabling requester pays:
    */
   enableRequesterPays(
-    callback?: EnableRequesterPaysCallback
+    optionsOrCallback?:
+      | EnableRequesterPaysCallback
+      | EnableRequesterPaysOptions,
+    cb?: EnableRequesterPaysCallback
   ): Promise<EnableRequesterPaysResponse> | void {
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    let options: EnableRequesterPaysOptions = {};
+    if (typeof optionsOrCallback === 'function') {
+      cb = optionsOrCallback;
+    } else if (optionsOrCallback) {
+      options = optionsOrCallback;
+    }
+
     this.setMetadata(
       {
         billing: {
           requesterPays: true,
         },
       },
-      callback || util.noop
+      options,
+      cb!
     );
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
   /**
@@ -2292,7 +2595,7 @@ class Bucket extends ServiceObject {
    */
   file(name: string, options?: FileOptions): File {
     if (!name) {
-      throw Error('A file name must be specified.');
+      throw Error(BucketExceptionMessages.SPECIFY_FILE_NAME);
     }
 
     return new File(this, name, options);
@@ -2325,16 +2628,20 @@ class Bucket extends ServiceObject {
    *     names, aside from the prefix, contain delimiter will have their name
    *     truncated after the delimiter, returned in `apiResponse.prefixes`.
    *     Duplicate prefixes are omitted.
-   * @deprecated @property {string} [directory] Filter results based on a directory name, or
-   *     more technically, a "prefix". Assumes delimeter to be '/'. Deprecated. Use prefix instead.
    * @property {string} [endOffset] Filter results to objects whose names are
    * lexicographically before endOffset. If startOffset is also set, the objects
    * listed have names between startOffset (inclusive) and endOffset (exclusive).
+   * @property {boolean} [includeFoldersAsPrefixes] If true, includes folders and
+   * managed folders in the set of prefixes returned by the query. Only applicable if
+   * delimiter is set to / and autoPaginate is set to false.
+   * See: https://cloud.google.com/storage/docs/managed-folders
    * @property {boolean} [includeTrailingDelimiter] If true, objects that end in
    * exactly one instance of delimiter have their metadata included in items[]
    * in addition to the relevant part of the object name appearing in prefixes[].
    * @property {string} [prefix] Filter results to objects whose names begin
    *     with this prefix.
+   * @property {string} [matchGlob] A glob pattern used to filter results,
+   *     for example foo*bar
    * @property {number} [maxApiCalls] Maximum number of API calls to make.
    * @property {number} [maxResults] Maximum number of items plus prefixes to
    *     return per call.
@@ -2344,6 +2651,9 @@ class Bucket extends ServiceObject {
    *     or 1 page of results will be returned per call.
    * @property {string} [pageToken] A previously-returned page token
    *     representing part of the larger set of results to view.
+   * @property {boolean} [softDeleted] If true, only soft-deleted object versions will be
+   *     listed as distinct results in order of generation number. Note `soft_deleted` and
+   *     `versions` cannot be set to true simultaneously.
    * @property {string} [startOffset] Filter results to objects whose names are
    * lexicographically equal to or after startOffset. If endOffset is also set,
    * the objects listed have names between startOffset (inclusive) and endOffset (exclusive).
@@ -2365,11 +2675,13 @@ class Bucket extends ServiceObject {
    *     names, aside from the prefix, contain delimiter will have their name
    *     truncated after the delimiter, returned in `apiResponse.prefixes`.
    *     Duplicate prefixes are omitted.
-   * @deprecated @param {string} [query.directory] Filter results based on a directory name, or
-   *     more technically, a "prefix". Assumes delimeter to be '/'. Deprecated. Use query.prefix instead.
    * @param {string} [query.endOffset] Filter results to objects whose names are
    * lexicographically before endOffset. If startOffset is also set, the objects
    * listed have names between startOffset (inclusive) and endOffset (exclusive).
+   * @param {boolean} [query.includeFoldersAsPrefixes] If true, includes folders and
+   * managed folders in the set of prefixes returned by the query. Only applicable if
+   * delimiter is set to / and autoPaginate is set to false.
+   * See: https://cloud.google.com/storage/docs/managed-folders
    * @param {boolean} [query.includeTrailingDelimiter] If true, objects that end in
    * exactly one instance of delimiter have their metadata included in items[]
    * in addition to the relevant part of the object name appearing in prefixes[].
@@ -2384,6 +2696,9 @@ class Bucket extends ServiceObject {
    *     or 1 page of results will be returned per call.
    * @param {string} [query.pageToken] A previously-returned page token
    *     representing part of the larger set of results to view.
+   * @param {boolean} [query.softDeleted] If true, only soft-deleted object versions will be
+   *     listed as distinct results in order of generation number. Note `soft_deleted` and
+   *     `versions` cannot be set to true simultaneously.
    * @param {string} [query.startOffset] Filter results to objects whose names are
    * lexicographically equal to or after startOffset. If endOffset is also set,
    * the objects listed have names between startOffset (inclusive) and endOffset (exclusive).
@@ -2501,10 +2816,12 @@ class Bucket extends ServiceObject {
       callback = queryOrCallback as GetFilesCallback;
     }
     query = Object.assign({}, query);
-
-    if (query.directory) {
-      query.prefix = `${query.directory}/`.replace(/\/*$/, '/');
-      delete query.directory;
+    if (
+      query.fields &&
+      query.autoPaginate &&
+      !query.fields.includes('nextPageToken')
+    ) {
+      query.fields = `${query.fields},nextPageToken`;
     }
 
     this.request(
@@ -2519,8 +2836,14 @@ class Bucket extends ServiceObject {
           return;
         }
 
-        const files = arrify(resp.items).map((file: Metadata) => {
+        const itemsArray = resp.items ? resp.items : [];
+        const files = itemsArray.map((file: FileMetadata) => {
           const options = {} as FileOptions;
+
+          if (query.fields) {
+            const fileInstance = file;
+            return fileInstance;
+          }
 
           if (query.versions) {
             options.generation = file.generation;
@@ -2530,7 +2853,7 @@ class Bucket extends ServiceObject {
             options.kmsKeyName = file.kmsKeyName;
           }
 
-          const fileInstance = this.file(file.name, options);
+          const fileInstance = this.file(file.name!, options);
           fileInstance.metadata = file;
 
           return fileInstance;
@@ -2552,20 +2875,24 @@ class Bucket extends ServiceObject {
   getLabels(callback: GetLabelsCallback): void;
   getLabels(options: GetLabelsOptions, callback: GetLabelsCallback): void;
   /**
+   * @deprecated
    * @typedef {object} GetLabelsOptions Configuration options for Bucket#getLabels().
    * @param {string} [userProject] The ID of the project which will be
    *     billed for the request.
    */
   /**
+   * @deprecated
    * @typedef {array} GetLabelsResponse
    * @property {object} 0 Object of labels currently set on this bucket.
    */
   /**
+   * @deprecated
    * @callback GetLabelsCallback
    * @param {?Error} err Request error, if any.
    * @param {object} labels Object of labels currently set on this bucket.
    */
   /**
+   * @deprecated Use getMetadata directly.
    * Get the labels currently set on this bucket.
    *
    * @param {object} [options] Configuration options.
@@ -2612,13 +2939,13 @@ class Bucket extends ServiceObject {
 
     this.getMetadata(
       options,
-      (err: ApiError | null, metadata: Metadata | null) => {
+      (err: ApiError | null, metadata: BucketMetadata | undefined) => {
         if (err) {
           callback!(err, null);
           return;
         }
 
-        callback!(null, metadata.labels || {});
+        callback!(null, metadata?.labels || {});
       }
     );
   }
@@ -2705,10 +3032,10 @@ class Bucket extends ServiceObject {
           callback!(err, null, resp);
           return;
         }
-
-        const notifications = arrify(resp.items).map(
-          (notification: Metadata) => {
-            const notificationInstance = this.notification(notification.id);
+        const itemsArray = resp.items ? resp.items : [];
+        const notifications = itemsArray.map(
+          (notification: NotificationMetadata) => {
+            const notificationInstance = this.notification(notification.id!);
             notificationInstance.metadata = notification;
             return notificationInstance;
           }
@@ -2735,7 +3062,7 @@ class Bucket extends ServiceObject {
    */
   /**
    * @typedef {object} GetBucketSignedUrlConfig
-   * @property {string} action Currently only supports "list" (HTTP: GET).
+   * @property {string} action Only listing objects within a bucket (HTTP: GET) is supported for bucket-level signed URLs.
    * @property {*} expires A timestamp when this link will expire. Any value
    *     given is passed to `new Date()`.
    *     Note: 'v4' supports maximum duration of 7 days (604800 seconds) from now.
@@ -2855,21 +3182,25 @@ class Bucket extends ServiceObject {
     callback?: GetSignedUrlCallback
   ): void | Promise<GetSignedUrlResponse> {
     const method = BucketActionToHTTPMethod[cfg.action];
-    if (!method) {
-      throw new Error('The action is not provided or invalid.');
-    }
 
-    const signConfig = {
+    const signConfig: SignerGetSignedUrlConfig = {
       method,
       expires: cfg.expires,
       version: cfg.version,
       cname: cfg.cname,
       extensionHeaders: cfg.extensionHeaders || {},
       queryParams: cfg.queryParams || {},
-    } as SignerGetSignedUrlConfig;
+      host: cfg.host,
+      signingEndpoint: cfg.signingEndpoint,
+    };
 
     if (!this.signer) {
-      this.signer = new URLSigner(this.storage.authClient, this);
+      this.signer = new URLSigner(
+        this.storage.authClient,
+        this,
+        undefined,
+        this.storage
+      );
     }
 
     this.signer
@@ -2918,7 +3249,7 @@ class Bucket extends ServiceObject {
   ): Promise<BucketLockResponse> | void {
     const metatype = typeof metageneration;
     if (metatype !== 'number' && metatype !== 'string') {
-      throw new Error('A metageneration must be provided.');
+      throw new Error(BucketExceptionMessages.METAGENERATION_NOT_PROVIDED);
     }
 
     this.request(
@@ -2931,6 +3262,27 @@ class Bucket extends ServiceObject {
       },
       callback!
     );
+  }
+
+  /**
+   * @typedef {object} RestoreOptions Options for Bucket#restore(). See an
+   *     {@link https://cloud.google.com/storage/docs/json_api/v1/buckets/restore#resource| Object resource}.
+   * @param {number} [generation] If present, selects a specific revision of this object.
+   * @param {string} [projection] Specifies the set of properties to return. If used, must be 'full' or 'noAcl'.
+   */
+  /**
+   * Restores a soft-deleted bucket
+   * @param {RestoreOptions} options Restore options.
+   * @returns {Promise<Bucket>}
+   */
+  async restore(options: RestoreOptions): Promise<Bucket> {
+    const [bucket] = await this.request({
+      method: 'POST',
+      uri: '/restore',
+      qs: options,
+    });
+
+    return bucket as Bucket;
   }
 
   makePrivate(
@@ -3061,28 +3413,45 @@ class Bucket extends ServiceObject {
       query.userProject = options.userProject;
     }
 
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    if (options.preconditionOpts?.ifGenerationMatch) {
+      query.ifGenerationMatch = options.preconditionOpts.ifGenerationMatch;
+    }
+
+    if (options.preconditionOpts?.ifGenerationNotMatch) {
+      query.ifGenerationNotMatch =
+        options.preconditionOpts.ifGenerationNotMatch;
+    }
+
+    if (options.preconditionOpts?.ifMetagenerationMatch) {
+      query.ifMetagenerationMatch =
+        options.preconditionOpts.ifMetagenerationMatch;
+    }
+
+    if (options.preconditionOpts?.ifMetagenerationNotMatch) {
+      query.ifMetagenerationNotMatch =
+        options.preconditionOpts.ifMetagenerationNotMatch;
+    }
 
     // You aren't allowed to set both predefinedAcl & acl properties on a bucket
     // so acl must explicitly be nullified.
-    const metadata = extend({}, options.metadata, {acl: null});
+    const metadata = {...options.metadata, acl: null};
 
-    this.setMetadata(metadata, query)
-      .then(() => {
+    this.setMetadata(metadata, query, (err: Error | null | undefined) => {
+      if (err) {
+        callback!(err);
+      }
+      const internalCall = () => {
         if (options.includeFiles) {
           return promisify<MakeAllFilesPublicPrivateOptions, File[]>(
             this.makeAllFilesPublicPrivate_
           ).call(this, options);
         }
-        return [];
-      })
-      .then(files => callback!(null, files), callback!)
-      .finally(() => {
-        this.storage.retryOptions.autoRetry = this.instanceRetryValue;
-      });
+        return Promise.resolve([] as File[]);
+      };
+      internalCall()
+        .then(files => callback!(null, files))
+        .catch(callback!);
+    });
   }
 
   makePublic(
@@ -3195,7 +3564,7 @@ class Bucket extends ServiceObject {
     callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
 
-    const req = extend(true, {public: true}, options);
+    const req = {public: true, ...options};
 
     this.acl
       .add({
@@ -3236,19 +3605,26 @@ class Bucket extends ServiceObject {
    */
   notification(id: string): Notification {
     if (!id) {
-      throw new Error('You must supply a notification ID.');
+      throw new Error(BucketExceptionMessages.SUPPLY_NOTIFICATION_ID);
     }
 
     return new Notification(this, id);
   }
 
-  removeRetentionPeriod(): Promise<SetBucketMetadataResponse>;
+  removeRetentionPeriod(
+    options?: SetBucketMetadataOptions
+  ): Promise<SetBucketMetadataResponse>;
   removeRetentionPeriod(callback: SetBucketMetadataCallback): void;
+  removeRetentionPeriod(
+    options: SetBucketMetadataOptions,
+    callback: SetBucketMetadataCallback
+  ): void;
   /**
    * Remove an already-existing retention policy from this bucket, if it is not
    * locked.
    *
    * @param {SetBucketMetadataCallback} [callback] Callback function.
+   * @param {SetBucketMetadataOptions} [options] Options, including precondition options
    * @returns {Promise<SetBucketMetadataResponse>}
    *
    * @example
@@ -3267,22 +3643,24 @@ class Bucket extends ServiceObject {
    * ```
    */
   removeRetentionPeriod(
+    optionsOrCallback?: SetBucketMetadataOptions | SetBucketMetadataCallback,
     callback?: SetBucketMetadataCallback
   ): Promise<SetBucketMetadataResponse> | void {
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    const options =
+      typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
+    callback =
+      typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+
     this.setMetadata(
       {
         retentionPolicy: null,
       },
+      options,
       callback!
     );
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
-  request(reqOpts: DecorateRequestOptions): Promise<[ResponseBody, Metadata]>;
+  request(reqOpts: DecorateRequestOptions): Promise<RequestResponse>;
   request(
     reqOpts: DecorateRequestOptions,
     callback: BodyResponseCallback
@@ -3298,9 +3676,9 @@ class Bucket extends ServiceObject {
   request(
     reqOpts: DecorateRequestOptions,
     callback?: BodyResponseCallback
-  ): void | Promise<[ResponseBody, Metadata]> {
+  ): void | Promise<RequestResponse> {
     if (this.userProject && (!reqOpts.qs || !reqOpts.qs.userProject)) {
-      reqOpts.qs = extend(reqOpts.qs, {userProject: this.userProject});
+      reqOpts.qs = {...reqOpts.qs, userProject: this.userProject};
     }
     return super.request(reqOpts, callback!);
   }
@@ -3316,20 +3694,24 @@ class Bucket extends ServiceObject {
     callback: SetLabelsCallback
   ): void;
   /**
+   * @deprecated
    * @typedef {array} SetLabelsResponse
    * @property {object} 0 The bucket metadata.
    */
   /**
+   * @deprecated
    * @callback SetLabelsCallback
    * @param {?Error} err Request error, if any.
    * @param {object} metadata The bucket metadata.
    */
   /**
+   * @deprecated
    * @typedef {object} SetLabelsOptions Configuration options for Bucket#setLabels().
    * @property {string} [userProject] The ID of the project which will be
    *     billed for the request.
    */
   /**
+   * @deprecated Use setMetadata directly.
    * Set labels on the bucket.
    *
    * This makes an underlying call to {@link Bucket#setMetadata}, which
@@ -3380,17 +3762,60 @@ class Bucket extends ServiceObject {
 
     callback = callback || util.noop;
 
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
     this.setMetadata({labels}, options, callback);
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
-  setRetentionPeriod(duration: number): Promise<SetBucketMetadataResponse>;
+  setMetadata(
+    metadata: BucketMetadata,
+    options?: SetMetadataOptions
+  ): Promise<SetMetadataResponse<BucketMetadata>>;
+  setMetadata(
+    metadata: BucketMetadata,
+    callback: MetadataCallback<BucketMetadata>
+  ): void;
+  setMetadata(
+    metadata: BucketMetadata,
+    options: SetMetadataOptions,
+    callback: MetadataCallback<BucketMetadata>
+  ): void;
+  setMetadata(
+    metadata: BucketMetadata,
+    optionsOrCallback: SetMetadataOptions | MetadataCallback<BucketMetadata>,
+    cb?: MetadataCallback<BucketMetadata>
+  ): Promise<SetMetadataResponse<BucketMetadata>> | void {
+    const options =
+      typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
+    cb =
+      typeof optionsOrCallback === 'function'
+        ? (optionsOrCallback as MetadataCallback<BucketMetadata>)
+        : cb;
+
+    this.disableAutoRetryConditionallyIdempotent_(
+      this.methods.setMetadata,
+      AvailableServiceObjectMethods.setMetadata,
+      options
+    );
+
+    super
+      .setMetadata(metadata, options)
+      .then(resp => cb!(null, ...resp))
+      .catch(cb!)
+      .finally(() => {
+        this.storage.retryOptions.autoRetry = this.instanceRetryValue;
+      });
+  }
+
   setRetentionPeriod(
     duration: number,
+    options?: SetBucketMetadataOptions
+  ): Promise<SetBucketMetadataResponse>;
+  setRetentionPeriod(
+    duration: number,
+    callback: SetBucketMetadataCallback
+  ): void;
+  setRetentionPeriod(
+    duration: number,
+    options: SetBucketMetadataOptions,
     callback: SetBucketMetadataCallback
   ): void;
   /**
@@ -3408,6 +3833,7 @@ class Bucket extends ServiceObject {
    * @param {*} duration In seconds, the minimum retention time for all objects
    *     contained in this bucket.
    * @param {SetBucketMetadataCallback} [callback] Callback function.
+   * @param {SetBucketMetadataCallback} [options] Options, including precondition options.
    * @returns {Promise<SetBucketMetadataResponse>}
    *
    * @example
@@ -3432,28 +3858,35 @@ class Bucket extends ServiceObject {
    */
   setRetentionPeriod(
     duration: number,
+    optionsOrCallback?: SetBucketMetadataOptions | SetBucketMetadataCallback,
     callback?: SetBucketMetadataCallback
   ): Promise<SetBucketMetadataResponse> | void {
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    const options =
+      typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
+    callback =
+      typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this.setMetadata(
       {
         retentionPolicy: {
-          retentionPeriod: duration,
+          retentionPeriod: duration.toString(),
         },
       },
+      options,
       callback!
     );
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
   setCorsConfiguration(
-    corsConfiguration: Cors[]
+    corsConfiguration: Cors[],
+    options?: SetBucketMetadataOptions
   ): Promise<SetBucketMetadataResponse>;
   setCorsConfiguration(
     corsConfiguration: Cors[],
+    callback: SetBucketMetadataCallback
+  ): void;
+  setCorsConfiguration(
+    corsConfiguration: Cors[],
+    options: SetBucketMetadataOptions,
     callback: SetBucketMetadataCallback
   ): void;
   /**
@@ -3483,6 +3916,7 @@ class Bucket extends ServiceObject {
    * @param {string[]} [corsConfiguration.responseHeader] A header allowed for cross origin
    *     resource sharing with this bucket.
    * @param {SetBucketMetadataCallback} [callback] Callback function.
+   * @param {SetBucketMetadataOptions} [options] Options, including precondition options.
    * @returns {Promise<SetBucketMetadataResponse>}
    *
    * @example
@@ -3503,19 +3937,20 @@ class Bucket extends ServiceObject {
    */
   setCorsConfiguration(
     corsConfiguration: Cors[],
+    optionsOrCallback?: SetBucketMetadataOptions | SetBucketMetadataCallback,
     callback?: SetBucketMetadataCallback
   ): Promise<SetBucketMetadataResponse> | void {
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
+    const options =
+      typeof optionsOrCallback === 'object' ? optionsOrCallback : {};
+    callback =
+      typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this.setMetadata(
       {
         cors: corsConfiguration,
       },
+      options,
       callback!
     );
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
   setStorageClass(
@@ -3588,10 +4023,6 @@ class Bucket extends ServiceObject {
     callback =
       typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
 
-    this.disableAutoRetryConditionallyIdempotent_(
-      this.methods.setMetadata,
-      AvailableServiceObjectMethods.setMetadata
-    );
     // In case we get input like `storageClass`, convert to `storage_class`.
     storageClass = storageClass
       .replace(/-/g, '_')
@@ -3601,7 +4032,6 @@ class Bucket extends ServiceObject {
       .toUpperCase();
 
     this.setMetadata({storageClass}, options, callback!);
-    this.storage.retryOptions.autoRetry = this.instanceRetryValue;
   }
 
   /**
@@ -3634,7 +4064,7 @@ class Bucket extends ServiceObject {
       const methodConfig = this.methods[method];
       if (typeof methodConfig === 'object') {
         if (typeof methodConfig.reqOpts === 'object') {
-          extend(methodConfig.reqOpts.qs, {userProject});
+          Object.assign(methodConfig.reqOpts.qs, {userProject});
         } else {
           methodConfig.reqOpts = {
             qs: {userProject},
@@ -3694,8 +4124,8 @@ class Bucket extends ServiceObject {
    *     `options.predefinedAcl = 'private'`)
    * @property {boolean} [public] Make the uploaded file public. (Alias for
    *     `options.predefinedAcl = 'publicRead'`)
-   * @property {boolean} [resumable] Force a resumable upload. (default:
-   *     true for files larger than 5 MB).
+   * @property {boolean} [resumable=true] Resumable uploads are automatically
+   *     enabled and must be shut off explicitly by setting to false.
    * @property {number} [timeout=60000] Set the HTTP request timeout in
    *     milliseconds. This option is not available for resumable uploads.
    *     Default: `60000`
@@ -3724,14 +4154,7 @@ class Bucket extends ServiceObject {
    * Upload a file to the bucket. This is a convenience method that wraps
    * {@link File#createWriteStream}.
    *
-   * You can specify whether or not an upload is resumable by setting
-   * `options.resumable`. *Resumable uploads are enabled by default if your
-   * input file is larger than 5 MB.*
-   *
-   * For faster crc32c computation, you must manually install
-   * {@link https://www.npmjs.com/package/fast-crc32c| `fast-crc32c`}:
-   *
-   *     $ npm install --save fast-crc32c
+   * Resumable uploads are enabled by default
    *
    * See {@link https://cloud.google.com/storage/docs/json_api/v1/how-tos/upload#uploads| Upload Options (Simple or Resumable)}
    * See {@link https://cloud.google.com/storage/docs/json_api/v1/objects/insert| Objects: insert API Documentation}
@@ -3779,8 +4202,8 @@ class Bucket extends ServiceObject {
    *     `options.predefinedAcl = 'private'`)
    * @param {boolean} [options.public] Make the uploaded file public. (Alias for
    *     `options.predefinedAcl = 'publicRead'`)
-   * @param {boolean} [options.resumable] Force a resumable upload. (default:
-   *     true for files larger than 5 MB).
+   * @param {boolean} [options.resumable=true] Resumable uploads are automatically
+   *     enabled and must be shut off explicitly by setting to false.
    * @param {number} [options.timeout=60000] Set the HTTP request timeout in
    *     milliseconds. This option is not available for resumable uploads.
    *     Default: `60000`
@@ -3821,7 +4244,6 @@ class Bucket extends ServiceObject {
    * //-
    * const options = {
    *   destination: 'new-image.png',
-   *   resumable: true,
    *   validation: 'crc32c',
    *   metadata: {
    *     metadata: {
@@ -3919,7 +4341,7 @@ class Bucket extends ServiceObject {
     callback?: UploadCallback
   ): Promise<UploadResponse> | void {
     const upload = (numberOfRetries: number | undefined) => {
-      const returnValue = retry(
+      const returnValue = AsyncRetry(
         async (bail: (err: Error) => void) => {
           await new Promise<void>((resolve, reject) => {
             if (
@@ -3933,6 +4355,7 @@ class Bucket extends ServiceObject {
               writable.on('progress', options.onUploadProgress);
             }
             fs.createReadStream(pathString)
+              .on('error', bail)
               .pipe(writable)
               .on('error', err => {
                 if (
@@ -3987,11 +4410,12 @@ class Bucket extends ServiceObject {
       options
     );
 
-    // Do not retry if precondition option ifMetagenerationMatch is not set
+    // Do not retry if precondition option ifGenerationMatch is not set
+    // because this is a file operation
     let maxRetries = this.storage.retryOptions.maxRetries;
     if (
-      (options?.preconditionOpts?.ifMetagenerationMatch === undefined &&
-        this.instancePreconditionOpts?.ifMetagenerationMatch === undefined &&
+      (options?.preconditionOpts?.ifGenerationMatch === undefined &&
+        this.instancePreconditionOpts?.ifGenerationMatch === undefined &&
         this.storage.retryOptions.idempotencyStrategy ===
           IdempotencyStrategy.RetryConditional) ||
       this.storage.retryOptions.idempotencyStrategy ===
@@ -4023,24 +4447,7 @@ class Bucket extends ServiceObject {
       });
     }
 
-    if (options.resumable !== null && typeof options.resumable === 'boolean') {
-      upload(maxRetries);
-    } else {
-      // Determine if the upload should be resumable if it's over the threshold.
-      fs.stat(pathString, (err, fd) => {
-        if (err) {
-          callback!(err);
-          return;
-        }
-
-        if (fd.size <= RESUMABLE_THRESHOLD) {
-          // Only disable resumable uploads so createWriteStream still attempts them and falls back to simple upload.
-          options.resumable = false;
-        }
-
-        upload(maxRetries);
-      });
-    }
+    upload(maxRetries);
   }
 
   makeAllFilesPublicPrivate_(
@@ -4118,7 +4525,7 @@ class Bucket extends ServiceObject {
         if (!options.force) {
           throw e;
         }
-        errors.push(e);
+        errors.push(e as Error);
       }
     };
 
@@ -4143,11 +4550,14 @@ class Bucket extends ServiceObject {
   disableAutoRetryConditionallyIdempotent_(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     coreOpts: any,
-    methodType: AvailableServiceObjectMethods
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    methodType: AvailableServiceObjectMethods,
+    localPreconditionOptions?: PreconditionOptions
   ): void {
     if (
       typeof coreOpts === 'object' &&
       coreOpts?.reqOpts?.qs?.ifMetagenerationMatch === undefined &&
+      localPreconditionOptions?.ifMetagenerationMatch === undefined &&
       (methodType === AvailableServiceObjectMethods.setMetadata ||
         methodType === AvailableServiceObjectMethods.delete) &&
       this.storage.retryOptions.idempotencyStrategy ===
@@ -4175,7 +4585,7 @@ paginator.extend(Bucket, 'getFiles');
  * that a callback is omitted.
  */
 promisifyAll(Bucket, {
-  exclude: ['request', 'file', 'notification'],
+  exclude: ['cloudStorageURI', 'request', 'file', 'notification', 'restore'],
 });
 
 /**

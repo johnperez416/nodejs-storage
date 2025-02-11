@@ -13,10 +13,11 @@
 // limitations under the License.
 
 import * as sinon from 'sinon';
-import * as proxyquire from 'proxyquire';
-import * as assert from 'assert';
+import proxyquire from 'proxyquire';
+import assert from 'assert';
 import {describe, it, beforeEach, afterEach} from 'mocha';
-import {util, ServiceObject} from '@google-cloud/common';
+import {util, ServiceObject} from '../src/nodejs-common/index.js';
+import {HmacKeyMetadata, IdempotencyStrategy} from '../src/index.js';
 
 const sandbox = sinon.createSandbox();
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -25,6 +26,14 @@ let STORAGE: any;
 let hmacKey: any;
 
 const ACCESS_ID = 'fake-access-id';
+
+class HTTPError extends Error {
+  code: number;
+  constructor(message: string, code: number) {
+    super(message);
+    this.code = code;
+  }
+}
 
 describe('HmacKey', () => {
   afterEach(() => sandbox.restore());
@@ -42,12 +51,23 @@ describe('HmacKey', () => {
       serviceObjectSpy = sandbox.spy(commonModule, 'ServiceObject');
 
       HmacKey = proxyquire('../src/hmacKey', {
-        '@google-cloud/common': commonModule,
+        './nodejs-common': commonModule,
       }).HmacKey;
 
       STORAGE = {
         request: util.noop,
         projectId: 'my-project',
+        retryOptions: {
+          autoRetry: true,
+          maxRetries: 3,
+          retryDelayMultipier: 2,
+          totalTimeout: 600,
+          maxRetryDelay: 60,
+          retryableErrorFn: (err: HTTPError) => {
+            return err.code === 500;
+          },
+          idempotencyStrategy: IdempotencyStrategy.RetryConditional,
+        },
       };
 
       hmacKey = new HmacKey(STORAGE, ACCESS_ID);
@@ -75,6 +95,15 @@ describe('HmacKey', () => {
       hmacKey = new HmacKey(STORAGE, ACCESS_ID, {projectId: 'another-project'});
       const ctorArg = serviceObjectSpy.firstCall.args[0];
       assert(ctorArg.baseUrl, '/projects/another-project/hmacKeys');
+    });
+
+    it('should correctly call setMetadata', done => {
+      hmacKey.setMetadata = (metadata: HmacKeyMetadata, callback: Function) => {
+        assert.deepStrictEqual(metadata.accessId, ACCESS_ID);
+        Promise.resolve([]).then(resp => callback(null, ...resp));
+      };
+
+      hmacKey.setMetadata({accessId: ACCESS_ID}, done);
     });
   });
 });

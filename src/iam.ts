@@ -15,20 +15,18 @@
 import {
   BodyResponseCallback,
   DecorateRequestOptions,
-  Metadata,
-} from '@google-cloud/common';
+} from './nodejs-common/index.js';
 import {promisifyAll} from '@google-cloud/promisify';
-import arrify = require('arrify');
 
-import {Bucket} from './bucket';
-import {normalize} from './util';
+import {Bucket} from './bucket.js';
+import {normalize} from './util.js';
 
 export interface GetPolicyOptions {
   userProject?: string;
   requestedPolicyVersion?: number;
 }
 
-export type GetPolicyResponse = [Policy, Metadata];
+export type GetPolicyResponse = [Policy, unknown];
 
 /**
  * @callback GetPolicyCallback
@@ -37,7 +35,7 @@ export type GetPolicyResponse = [Policy, Metadata];
  * @param {object} apiResponse The full API response.
  */
 export interface GetPolicyCallback {
-  (err?: Error | null, acl?: Policy, apiResponse?: Metadata): void;
+  (err?: Error | null, acl?: Policy, apiResponse?: unknown): void;
 }
 
 /**
@@ -54,7 +52,7 @@ export interface SetPolicyOptions {
  * @property {object} 0 The policy.
  * @property {object} 1 The full API response.
  */
-export type SetPolicyResponse = [Policy, Metadata];
+export type SetPolicyResponse = [Policy, unknown];
 
 /**
  * @callback SetPolicyCallback
@@ -89,7 +87,7 @@ export interface Expr {
  * @property {object} 0 A subset of permissions that the caller is allowed.
  * @property {object} 1 The full API response.
  */
-export type TestIamPermissionsResponse = [{[key: string]: boolean}, Metadata];
+export type TestIamPermissionsResponse = [{[key: string]: boolean}, unknown];
 
 /**
  * @callback TestIamPermissionsCallback
@@ -101,7 +99,7 @@ export interface TestIamPermissionsCallback {
   (
     err?: Error | null,
     acl?: {[key: string]: boolean} | null,
-    apiResponse?: Metadata
+    apiResponse?: unknown
   ): void;
 }
 
@@ -117,6 +115,11 @@ export interface TestIamPermissionsOptions {
 interface GetPolicyRequest {
   userProject?: string;
   optionsRequestedPolicyVersion?: number;
+}
+
+export enum IAMExceptionMessages {
+  POLICY_OBJECT_REQUIRED = 'A policy object is required.',
+  PERMISSIONS_REQUIRED = 'Permissions are required.',
 }
 
 /**
@@ -283,7 +286,7 @@ class Iam {
    * @throws {Error} If no policy is provided.
    *
    * @param {Policy} policy The policy.
-   * @param {SetPolicyOptions} [options] Configuration opbject.
+   * @param {SetPolicyOptions} [options] Configuration options.
    * @param {SetPolicyCallback} callback Callback function.
    * @returns {Promise<SetPolicyResponse>}
    *
@@ -331,7 +334,7 @@ class Iam {
     callback?: SetPolicyCallback
   ): Promise<SetPolicyResponse> | void {
     if (policy === null || typeof policy !== 'object') {
-      throw new Error('A policy object is required.');
+      throw new Error(IAMExceptionMessages.POLICY_OBJECT_REQUIRED);
     }
 
     const {options, callback: cb} = normalize<
@@ -339,10 +342,16 @@ class Iam {
       SetPolicyCallback
     >(optionsOrCallback, callback);
 
+    let maxRetries;
+    if (policy.etag === undefined) {
+      maxRetries = 0;
+    }
+
     this.request_(
       {
         method: 'PUT',
         uri: '/iam',
+        maxRetries,
         json: Object.assign(
           {
             resourceId: this.resourceId_,
@@ -429,7 +438,7 @@ class Iam {
     callback?: TestIamPermissionsCallback
   ): Promise<TestIamPermissionsResponse> | void {
     if (!Array.isArray(permissions) && typeof permissions !== 'string') {
-      throw new Error('Permissions are required.');
+      throw new Error(IAMExceptionMessages.PERMISSIONS_REQUIRED);
     }
 
     const {options, callback: cb} = normalize<
@@ -437,7 +446,9 @@ class Iam {
       TestIamPermissionsCallback
     >(optionsOrCallback, callback);
 
-    const permissionsArray = arrify(permissions);
+    const permissionsArray = Array.isArray(permissions)
+      ? permissions
+      : [permissions];
 
     const req = Object.assign(
       {
@@ -458,7 +469,9 @@ class Iam {
           return;
         }
 
-        const availablePermissions = arrify(resp.permissions);
+        const availablePermissions = Array.isArray(resp.permissions)
+          ? resp.permissions
+          : [];
 
         const permissionsHash = permissionsArray.reduce(
           (acc: {[index: string]: boolean}, permission) => {

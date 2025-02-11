@@ -13,55 +13,57 @@
 // limitations under the License.
 
 import {
+  BaseMetadata,
   DecorateRequestOptions,
-  Metadata,
   ServiceObject,
   ServiceObjectConfig,
   util,
-} from '@google-cloud/common';
-import arrify = require('arrify');
-import * as assert from 'assert';
-import * as extend from 'extend';
+} from '../src/nodejs-common/index.js';
+import assert from 'assert';
 import * as fs from 'fs';
 import {describe, it, before, beforeEach, after, afterEach} from 'mocha';
-import * as mime from 'mime-types';
-import pLimit = require('p-limit');
+import mime from 'mime';
+import pLimit from 'p-limit';
 import * as path from 'path';
-import * as proxyquire from 'proxyquire';
+import proxyquire from 'proxyquire';
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const snakeize = require('snakeize');
 import * as stream from 'stream';
-import {Bucket, Channel, Notification} from '../src';
+import {Bucket, Channel, Notification, CRC32C} from '../src/index.js';
 import {
   CreateWriteStreamOptions,
   File,
   SetFileMetadataOptions,
   FileOptions,
-} from '../src/file';
+  FileMetadata,
+} from '../src/file.js';
 import {PromisifyAllOptions} from '@google-cloud/promisify';
 import {
   GetBucketMetadataCallback,
   GetFilesOptions,
   MakeAllFilesPublicPrivateOptions,
-  SetBucketMetadataCallback,
   SetBucketMetadataResponse,
   GetBucketSignedUrlConfig,
   AvailableServiceObjectMethods,
-} from '../src/bucket';
-import {AddAclOptions} from '../src/acl';
-import {Policy} from '../src/iam';
-import sinon = require('sinon');
+  BucketExceptionMessages,
+  BucketMetadata,
+  LifecycleRule,
+} from '../src/bucket.js';
+import {AddAclOptions} from '../src/acl.js';
+import {Policy} from '../src/iam.js';
+import sinon from 'sinon';
 import {Transform} from 'stream';
-import {IdempotencyStrategy} from '../src/storage';
+import {IdempotencyStrategy} from '../src/storage.js';
+import {convertObjKeysToSnakeCase, getDirName} from '../src/util.js';
+import {DEFAULT_UNIVERSE} from 'google-auth-library';
 
 class FakeFile {
   calledWith_: IArguments;
   bucket: Bucket;
   name: string;
   options: FileOptions;
-  metadata: {};
+  metadata: FileMetadata;
   createWriteStream: Function;
+  delete: Function;
   isSameFile = () => false;
   constructor(bucket: Bucket, name: string, options?: FileOptions) {
     // eslint-disable-next-line prefer-rest-params
@@ -72,7 +74,7 @@ class FakeFile {
     this.metadata = {};
 
     this.createWriteStream = (options: CreateWriteStreamOptions) => {
-      this.metadata = options.metadata;
+      this.metadata = options.metadata!;
       const ws = new stream.Writable();
       ws.write = () => {
         ws.emit('complete');
@@ -80,6 +82,10 @@ class FakeFile {
         return true;
       };
       return ws;
+    };
+
+    this.delete = () => {
+      return Promise.resolve();
     };
   }
 }
@@ -94,11 +100,12 @@ class FakeNotification {
 }
 
 let fsStatOverride: Function | null;
-const fakeFs = extend(true, {}, fs, {
+const fakeFs = {
+  ...fs,
   stat: (filePath: string, callback: Function) => {
     return (fsStatOverride || fs.stat)(filePath, callback);
   },
-});
+};
 
 let pLimitOverride: Function | null;
 const fakePLimit = (limit: number) => (pLimitOverride || pLimit)(limit);
@@ -113,9 +120,11 @@ const fakePromisify = {
 
     promisified = true;
     assert.deepStrictEqual(options.exclude, [
+      'cloudStorageURI',
       'request',
       'file',
       'notification',
+      'restore',
     ]);
   },
 };
@@ -131,8 +140,7 @@ const fakePaginator = {
       if (Class.name !== 'Bucket') {
         return;
       }
-
-      methods = arrify(methods);
+      methods = Array.isArray(methods) ? methods : [methods];
       assert.strictEqual(Class.name, 'Bucket');
       assert.deepStrictEqual(methods, ['getFiles']);
       extended = true;
@@ -157,7 +165,7 @@ class FakeIam {
   }
 }
 
-class FakeServiceObject extends ServiceObject {
+class FakeServiceObject extends ServiceObject<FakeServiceObject, BaseMetadata> {
   calledWith_: IArguments;
   constructor(config: ServiceObjectConfig) {
     super(config);
@@ -197,6 +205,8 @@ describe('Bucket', () => {
       },
       idempotencyStrategy: IdempotencyStrategy.RetryConditional,
     },
+    crc32cGenerator: () => new CRC32C(),
+    universeDomain: DEFAULT_UNIVERSE,
   };
   const BUCKET_NAME = 'test-bucket';
 
@@ -206,7 +216,7 @@ describe('Bucket', () => {
       'p-limit': fakePLimit,
       '@google-cloud/promisify': fakePromisify,
       '@google-cloud/paginator': fakePaginator,
-      '@google-cloud/common': {
+      './nodejs-common': {
         ServiceObject: FakeServiceObject,
         util: fakeUtil,
       },
@@ -429,6 +439,26 @@ describe('Bucket', () => {
 
       assert.strictEqual(bucket.userProject, fakeUserProject);
     });
+
+    it('should accept a `crc32cGenerator`', () => {
+      const crc32cGenerator = () => {};
+
+      const bucket = new Bucket(STORAGE, 'bucket-name', {crc32cGenerator});
+      assert.strictEqual(bucket.crc32cGenerator, crc32cGenerator);
+    });
+
+    it("should use storage's `crc32cGenerator` by default", () => {
+      assert.strictEqual(bucket.crc32cGenerator, STORAGE.crc32cGenerator);
+    });
+  });
+
+  describe('cloudStorageURI', () => {
+    it('should return the appropriate `gs://` URI', () => {
+      const bucket = new Bucket(STORAGE, BUCKET_NAME);
+
+      assert(bucket.cloudStorageURI instanceof URL);
+      assert.equal(bucket.cloudStorageURI.host, BUCKET_NAME);
+    });
   });
 
   describe('addLifecycleRule', () => {
@@ -446,54 +476,8 @@ describe('Bucket', () => {
         condition: {},
       };
 
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.deepStrictEqual(metadata.lifecycle.rule, [rule]);
-        done();
-      };
-
-      bucket.addLifecycleRule(rule, assert.ifError);
-    });
-
-    it('should properly capitalize rule action', done => {
-      const rule = {
-        action: 'delete',
-        condition: {},
-      };
-
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.deepStrictEqual(metadata.lifecycle.rule, [
-          {
-            action: {
-              type: rule.action.charAt(0).toUpperCase() + rule.action.slice(1),
-            },
-            condition: rule.condition,
-          },
-        ]);
-
-        done();
-      };
-
-      bucket.addLifecycleRule(rule, assert.ifError);
-    });
-
-    it('should properly set the storage class', done => {
-      const rule = {
-        action: 'setStorageClass',
-        storageClass: 'storage class',
-        condition: {},
-      };
-
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.deepStrictEqual(metadata.lifecycle.rule, [
-          {
-            action: {
-              type: rule.action.charAt(0).toUpperCase() + rule.action.slice(1),
-              storageClass: rule.storageClass,
-            },
-            condition: rule.condition,
-          },
-        ]);
-
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.deepStrictEqual(metadata.lifecycle!.rule, [rule]);
         done();
       };
 
@@ -502,17 +486,19 @@ describe('Bucket', () => {
 
     it('should properly set condition', done => {
       const rule = {
-        action: 'delete',
+        action: {
+          type: 'Delete',
+        },
         condition: {
           age: 30,
         },
       };
 
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.deepStrictEqual(metadata.lifecycle.rule, [
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.deepStrictEqual(metadata.lifecycle?.rule, [
           {
             action: {
-              type: rule.action.charAt(0).toUpperCase() + rule.action.slice(1),
+              type: 'Delete',
             },
             condition: rule.condition,
           },
@@ -527,16 +513,18 @@ describe('Bucket', () => {
       const date = new Date();
 
       const rule = {
-        action: 'delete',
+        action: {
+          type: 'Delete',
+        },
         condition: {
           createdBefore: date,
         },
       };
 
-      bucket.setMetadata = (metadata: Metadata) => {
+      bucket.setMetadata = (metadata: BucketMetadata) => {
         const expectedDateString = date.toISOString().replace(/T.+$/, '');
 
-        const rule = metadata.lifecycle.rule[0];
+        const rule = metadata!.lifecycle!.rule![0];
         assert.strictEqual(rule.condition.createdBefore, expectedDateString);
 
         done();
@@ -561,9 +549,9 @@ describe('Bucket', () => {
         done(new Error('Metadata should not be refreshed.'));
       };
 
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.strictEqual(metadata.lifecycle.rule.length, 1);
-        assert.deepStrictEqual(metadata.lifecycle.rule, [rule]);
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.strictEqual(metadata!.lifecycle!.rule!.length, 1);
+        assert.deepStrictEqual(metadata.lifecycle?.rule, [rule]);
         done();
       };
 
@@ -571,16 +559,16 @@ describe('Bucket', () => {
     });
 
     it('should combine rule with existing rules by default', done => {
-      const existingRule = {
+      const existingRule: LifecycleRule = {
         action: {
-          type: 'type',
+          type: 'Delete',
         },
         condition: {},
       };
 
-      const newRule = {
+      const newRule: LifecycleRule = {
         action: {
-          type: 'type',
+          type: 'Delete',
         },
         condition: {},
       };
@@ -589,9 +577,9 @@ describe('Bucket', () => {
         callback(null, {lifecycle: {rule: [existingRule]}}, {});
       };
 
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.strictEqual(metadata.lifecycle.rule.length, 2);
-        assert.deepStrictEqual(metadata.lifecycle.rule, [
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.strictEqual(metadata!.lifecycle!.rule!.length, 2);
+        assert.deepStrictEqual(metadata.lifecycle?.rule, [
           existingRule,
           newRule,
         ]);
@@ -601,22 +589,44 @@ describe('Bucket', () => {
       bucket.addLifecycleRule(newRule, assert.ifError);
     });
 
-    it('should pass callback to setMetadata', done => {
-      const rule = {
+    it('should accept multiple rules', done => {
+      const existingRule: LifecycleRule = {
         action: {
-          type: 'type',
+          type: 'Delete',
         },
         condition: {},
       };
 
-      bucket.setMetadata = (
-        metadata: Metadata,
-        callback: SetBucketMetadataCallback
-      ) => {
-        callback(); // done()
+      const newRules: LifecycleRule[] = [
+        {
+          action: {
+            type: 'Delete',
+          },
+          condition: {},
+        },
+        {
+          action: {
+            type: 'Delete',
+          },
+          condition: {},
+        },
+      ];
+
+      bucket.getMetadata = (callback: GetBucketMetadataCallback) => {
+        callback(null, {lifecycle: {rule: [existingRule]}}, {});
       };
 
-      bucket.addLifecycleRule(rule, done);
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.strictEqual(metadata!.lifecycle!.rule!.length, 3);
+        assert.deepStrictEqual(metadata.lifecycle?.rule, [
+          existingRule,
+          newRules[0],
+          newRules[1],
+        ]);
+        done();
+      };
+
+      bucket.addLifecycleRule(newRules, assert.ifError);
     });
 
     it('should pass error from getMetadata to callback', done => {
@@ -639,40 +649,24 @@ describe('Bucket', () => {
         done();
       });
     });
-
-    it('should disable auto-retries when ifMetagenerationMatch is not set', done => {
-      const rule = {
-        action: {
-          type: 'type',
-        },
-        condition: {},
-      };
-
-      bucket.setMetadata = () => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-      };
-
-      bucket.addLifecycleRule(rule, assert.ifError);
-      assert.strictEqual(bucket.storage.retryOptions.autoRetry, true);
-      done();
-    });
   });
 
   describe('combine', () => {
     it('should throw if invalid sources are provided', () => {
       assert.throws(() => {
-        bucket.combine();
-      }, /You must provide at least one source file\./);
+        bucket.combine(), BucketExceptionMessages.PROVIDE_SOURCE_FILE;
+      });
 
       assert.throws(() => {
-        bucket.combine([]);
-      }, /You must provide at least one source file\./);
+        bucket.combine([]), BucketExceptionMessages.PROVIDE_SOURCE_FILE;
+      });
     });
 
     it('should throw if a destination is not provided', () => {
       assert.throws(() => {
-        bucket.combine(['1', '2']);
-      }, /A destination file must be specified\./);
+        bucket.combine(['1', '2']),
+          BucketExceptionMessages.DESTINATION_FILE_NOT_SPECIFIED;
+      });
     });
 
     it('should accept string or file input for sources', done => {
@@ -711,7 +705,7 @@ describe('Bucket', () => {
       destination.request = (reqOpts: DecorateRequestOptions) => {
         assert.strictEqual(
           reqOpts.json.destination.contentType,
-          mime.contentType(destination.name)
+          mime.getType(destination.name)
         );
 
         done();
@@ -742,7 +736,7 @@ describe('Bucket', () => {
       destination.request = (reqOpts: DecorateRequestOptions) => {
         assert.strictEqual(
           reqOpts.json.destination.contentType,
-          mime.contentType(destination.name)
+          mime.getType(destination.name)
         );
 
         done();
@@ -752,13 +746,16 @@ describe('Bucket', () => {
     });
 
     it('should make correct API request', done => {
-      const sources = [bucket.file('1.txt'), bucket.file('2.txt')];
-      const destination = bucket.file('destination.txt');
+      const sources = [bucket.file('1.foo'), bucket.file('2.foo')];
+      const destination = bucket.file('destination.foo');
 
       destination.request = (reqOpts: DecorateRequestOptions) => {
         assert.strictEqual(reqOpts.uri, '/compose');
         assert.deepStrictEqual(reqOpts.json, {
-          destination: {contentType: mime.contentType(destination.name)},
+          destination: {
+            contentType: mime.getType(destination.name) || undefined,
+            contentEncoding: undefined,
+          },
           sourceObjects: [{name: sources[0].name}, {name: sources[1].name}],
         });
 
@@ -849,42 +846,6 @@ describe('Bucket', () => {
       bucket.combine(sources, destination, options, assert.ifError);
     });
 
-    it('should respect constructor precondition options', done => {
-      bucket = new Bucket(STORAGE, BUCKET_NAME, {
-        preconditionOpts: {
-          ifGenerationMatch: 301,
-          ifGenerationNotMatch: 302,
-          ifMetagenerationMatch: 303,
-          ifMetagenerationNotMatch: 304,
-        },
-      });
-      const sources = [bucket.file('1.txt'), bucket.file('2.txt')];
-      const destination = bucket.file('destination.txt');
-
-      const options = {};
-      destination.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(
-          reqOpts.qs.ifGenerationMatch,
-          bucket.instancePreconditionOpts.ifGenerationMatch
-        );
-        assert.strictEqual(
-          reqOpts.qs.ifGenerationNotMatch,
-          bucket.instancePreconditionOpts.ifGenerationNotMatch
-        );
-        assert.strictEqual(
-          reqOpts.qs.ifMetagenerationMatch,
-          bucket.instancePreconditionOpts.ifMetagenerationMatch
-        );
-        assert.strictEqual(
-          reqOpts.qs.ifMetagenerationNotMatch,
-          bucket.instancePreconditionOpts.ifMetagenerationNotMatch
-        );
-        done();
-      };
-
-      bucket.combine(sources, destination, options, assert.ifError);
-    });
-
     it('should execute the callback', done => {
       const sources = [bucket.file('1.txt'), bucket.file('2.txt')];
       const destination = bucket.file('destination.txt');
@@ -964,14 +925,8 @@ describe('Bucket', () => {
 
     it('should throw if an ID is not provided', () => {
       assert.throws(() => {
-        bucket.createChannel();
-      }, /An ID is required to create a channel\./);
-    });
-
-    it('should throw if an address is not provided', () => {
-      assert.throws(() => {
-        bucket.createChannel(ID, {});
-      }, /An address is required to create a channel\./);
+        bucket.createChannel(), BucketExceptionMessages.CHANNEL_ID_REQUIRED;
+      });
     });
 
     it('should make the correct request', done => {
@@ -1096,8 +1051,9 @@ describe('Bucket', () => {
 
     it('should throw an error if a valid topic is not provided', () => {
       assert.throws(() => {
-        bucket.createNotification();
-      }, /A valid topic name is required\./);
+        bucket.createNotification(),
+          BucketExceptionMessages.TOPIC_NAME_REQUIRED;
+      });
     });
 
     it('should make the correct request', done => {
@@ -1106,7 +1062,7 @@ describe('Bucket', () => {
       const expectedTopic = PUBSUB_SERVICE_PATH + topic;
       const expectedJson = Object.assign(
         {topic: expectedTopic},
-        snakeize(options)
+        convertObjKeysToSnakeCase(options)
       );
 
       bucket.request = (reqOpts: DecorateRequestOptions) => {
@@ -1236,10 +1192,35 @@ describe('Bucket', () => {
   });
 
   describe('deleteFiles', () => {
+    let readCount: number;
+
+    beforeEach(() => {
+      readCount = 0;
+    });
+
     it('should accept only a callback', done => {
-      bucket.getFiles = (query: {}) => {
+      const files = [bucket.file('1'), bucket.file('2')].map(file => {
+        file.delete = () => {
+          return Promise.resolve();
+        };
+        return file;
+      });
+
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          if (readCount < 1) {
+            this.push(files[readCount]);
+            readCount++;
+          } else {
+            this.push(null);
+          }
+        },
+      });
+
+      bucket.getFilesStream = (query: {}) => {
         assert.deepStrictEqual(query, {});
-        return Promise.all([[]]);
+        return readable;
       };
 
       bucket.deleteFiles(done);
@@ -1248,9 +1229,28 @@ describe('Bucket', () => {
     it('should get files from the bucket', done => {
       const query = {a: 'b', c: 'd'};
 
-      bucket.getFiles = (query_: {}) => {
+      const files = [bucket.file('1'), bucket.file('2')].map(file => {
+        file.delete = () => {
+          return Promise.resolve();
+        };
+        return file;
+      });
+
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          if (readCount < 1) {
+            this.push(files[readCount]);
+            readCount++;
+          } else {
+            this.push(null);
+          }
+        },
+      });
+
+      bucket.getFilesStream = (query_: {}) => {
         assert.deepStrictEqual(query_, query);
-        return Promise.resolve([[]]);
+        return readable;
       };
 
       bucket.deleteFiles(query, done);
@@ -1263,7 +1263,26 @@ describe('Bucket', () => {
         return () => {};
       };
 
-      bucket.getFiles = () => Promise.resolve([[]]);
+      const files = [bucket.file('1'), bucket.file('2')].map(file => {
+        file.delete = () => {
+          return Promise.resolve();
+        };
+        return file;
+      });
+
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          if (readCount < 1) {
+            this.push(files[readCount]);
+            readCount++;
+          } else {
+            this.push(null);
+          }
+        },
+      });
+
+      bucket.getFilesStream = () => readable;
       bucket.deleteFiles({}, assert.ifError);
     });
 
@@ -1280,9 +1299,21 @@ describe('Bucket', () => {
         return file;
       });
 
-      bucket.getFiles = (query_: {}) => {
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          if (readCount < files.length) {
+            this.push(files[readCount]);
+            readCount++;
+          } else {
+            this.push(null);
+          }
+        },
+      });
+
+      bucket.getFilesStream = (query_: {}) => {
         assert.strictEqual(query_, query);
-        return Promise.resolve([files]);
+        return readable;
       };
 
       bucket.deleteFiles(query, (err: Error) => {
@@ -1294,9 +1325,15 @@ describe('Bucket', () => {
 
     it('should execute callback with error from getting files', done => {
       const error = new Error('Error.');
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          this.destroy(error);
+        },
+      });
 
-      bucket.getFiles = () => {
-        return Promise.reject(error);
+      bucket.getFilesStream = () => {
+        return readable;
       };
 
       bucket.deleteFiles({}, (err: Error) => {
@@ -1313,8 +1350,20 @@ describe('Bucket', () => {
         return file;
       });
 
-      bucket.getFiles = () => {
-        return Promise.resolve([files]);
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          if (readCount < files.length) {
+            this.push(files[readCount]);
+            readCount++;
+          } else {
+            this.push(null);
+          }
+        },
+      });
+
+      bucket.getFilesStream = () => {
+        return readable;
       };
 
       bucket.deleteFiles({}, (err: Error) => {
@@ -1331,8 +1380,20 @@ describe('Bucket', () => {
         return file;
       });
 
-      bucket.getFiles = () => {
-        return Promise.resolve([files]);
+      const readable = new stream.Readable({
+        objectMode: true,
+        read() {
+          if (readCount < files.length) {
+            this.push(files[readCount]);
+            readCount++;
+          } else {
+            this.push(null);
+          }
+        },
+      });
+
+      bucket.getFilesStream = () => {
+        return readable;
       };
 
       bucket.deleteFiles({force: true}, (errs: Array<{}>) => {
@@ -1422,21 +1483,29 @@ describe('Bucket', () => {
 
   describe('disableRequesterPays', () => {
     it('should call setMetadata correctly', done => {
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
+      bucket.setMetadata = (
+        metadata: {},
+        _optionsOrCallback: {},
+        callback: Function
+      ) => {
         assert.deepStrictEqual(metadata, {
           billing: {
             requesterPays: false,
           },
         });
-        callback(); // done()
+        Promise.resolve([]).then(resp => callback(null, ...resp));
       };
 
       bucket.disableRequesterPays(done);
     });
 
     it('should not require a callback', done => {
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
-        assert.doesNotThrow(() => callback());
+      bucket.setMetadata = (
+        metadata: {},
+        optionsOrCallback: {},
+        callback: Function
+      ) => {
+        assert.strictEqual(callback, undefined);
         done();
       };
 
@@ -1445,8 +1514,10 @@ describe('Bucket', () => {
 
     it('should set autoRetry to false when ifMetagenerationMatch is undefined', done => {
       bucket.setMetadata = () => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        done();
+        Promise.resolve().then(() => {
+          assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
+          done();
+        });
       };
       bucket.disableRequesterPays();
     });
@@ -1465,14 +1536,16 @@ describe('Bucket', () => {
 
     it('should throw if a config object is not provided', () => {
       assert.throws(() => {
-        bucket.enableLogging();
-      }, /A configuration object with a prefix is required\./);
+        bucket.enableLogging(),
+          BucketExceptionMessages.CONFIGURATION_OBJECT_PREFIX_REQUIRED;
+      });
     });
 
     it('should throw if config is a function', () => {
       assert.throws(() => {
-        bucket.enableLogging(assert.ifError);
-      }, /A configuration object with a prefix is required\./);
+        bucket.enableLogging(assert.ifError),
+          BucketExceptionMessages.CONFIGURATION_OBJECT_PREFIX_REQUIRED;
+      });
     });
 
     it('should throw if a prefix is not provided', () => {
@@ -1482,8 +1555,9 @@ describe('Bucket', () => {
             bucket: 'bucket-name',
           },
           assert.ifError
-        );
-      }, /A configuration object with a prefix is required\./);
+        ),
+          BucketExceptionMessages.CONFIGURATION_OBJECT_PREFIX_REQUIRED;
+      });
     });
 
     it('should add IAM permissions', done => {
@@ -1536,7 +1610,7 @@ describe('Bucket', () => {
     });
 
     it('should update the logging metadata configuration', done => {
-      bucket.setMetadata = (metadata: Metadata) => {
+      bucket.setMetadata = (metadata: BucketMetadata) => {
         assert.deepStrictEqual(metadata.logging, {
           logBucket: bucket.id,
           logObjectPrefix: PREFIX,
@@ -1551,8 +1625,8 @@ describe('Bucket', () => {
     it('should allow a custom bucket to be provided', done => {
       const bucketName = 'bucket-name';
 
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.deepStrictEqual(metadata.logging.logBucket, bucketName);
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.deepStrictEqual(metadata!.logging!.logBucket, bucketName);
         setImmediate(done);
         return Promise.resolve([]);
       };
@@ -1569,8 +1643,11 @@ describe('Bucket', () => {
     it('should accept a Bucket object', done => {
       const bucketForLogging = new Bucket(STORAGE, 'bucket-name');
 
-      bucket.setMetadata = (metadata: Metadata) => {
-        assert.deepStrictEqual(metadata.logging.logBucket, bucketForLogging.id);
+      bucket.setMetadata = (metadata: BucketMetadata) => {
+        assert.deepStrictEqual(
+          metadata!.logging!.logBucket,
+          bucketForLogging.id
+        );
         setImmediate(done);
         return Promise.resolve([]);
       };
@@ -1587,7 +1664,15 @@ describe('Bucket', () => {
     it('should execute the callback with the setMetadata response', done => {
       const setMetadataResponse = {};
 
-      bucket.setMetadata = () => Promise.resolve([setMetadataResponse]);
+      bucket.setMetadata = (
+        metadata: {},
+        optionsOrCallback: {},
+        callback: Function
+      ) => {
+        Promise.resolve([setMetadataResponse]).then(resp =>
+          callback(null, ...resp)
+        );
+      };
 
       bucket.enableLogging(
         {prefix: PREFIX},
@@ -1611,44 +1696,33 @@ describe('Bucket', () => {
         done();
       });
     });
-
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      bucket.setMetadata = () => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-      };
-
-      bucket.enableLogging({prefix: PREFIX}, () => {
-        done();
-      });
-    });
   });
 
   describe('enableRequesterPays', () => {
     it('should call setMetadata correctly', done => {
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
+      bucket.setMetadata = (
+        metadata: {},
+        optionsOrCallback: {},
+        callback: Function
+      ) => {
         assert.deepStrictEqual(metadata, {
           billing: {
             requesterPays: true,
           },
         });
-        callback(); // done()
+        Promise.resolve([]).then(resp => callback(null, ...resp));
       };
 
       bucket.enableRequesterPays(done);
     });
 
     it('should not require a callback', done => {
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
-        assert.doesNotThrow(() => callback());
-        done();
-      };
-
-      bucket.enableRequesterPays();
-    });
-
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      bucket.setMetadata = () => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
+      bucket.setMetadata = (
+        metadata: {},
+        optionsOrCallback: {},
+        callback: Function
+      ) => {
+        assert.equal(callback, undefined);
         done();
       };
 
@@ -1667,8 +1741,8 @@ describe('Bucket', () => {
 
     it('should throw if no name is provided', () => {
       assert.throws(() => {
-        bucket.file();
-      }, /A file name must be specified\./);
+        bucket.file(), BucketExceptionMessages.SPECIFY_FILE_NAME;
+      });
     });
 
     it('should return a File object', () => {
@@ -1702,31 +1776,25 @@ describe('Bucket', () => {
     it('should get files with a query', done => {
       const token = 'next-page-token';
       bucket.request = (reqOpts: DecorateRequestOptions) => {
-        assert.deepStrictEqual(reqOpts.qs, {maxResults: 5, pageToken: token});
+        assert.deepStrictEqual(reqOpts.qs, {
+          maxResults: 5,
+          pageToken: token,
+          includeFoldersAsPrefixes: true,
+          delimiter: '/',
+          autoPaginate: false,
+        });
         done();
       };
-      bucket.getFiles({maxResults: 5, pageToken: token}, util.noop);
-    });
-
-    it('should allow setting a directory', done => {
-      //Note: Directory is deprecated.
-      const directory = 'directory-name';
-      bucket.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(reqOpts.qs.prefix, `${directory}/`);
-        assert.strictEqual(reqOpts.qs.directory, undefined);
-        done();
-      };
-      bucket.getFiles({directory}, assert.ifError);
-    });
-
-    it('should strip excess slashes from a directory', done => {
-      //Note: Directory is deprecated.
-      const directory = 'directory-name///';
-      bucket.request = (reqOpts: DecorateRequestOptions) => {
-        assert.strictEqual(reqOpts.qs.prefix, 'directory-name/');
-        done();
-      };
-      bucket.getFiles({directory}, assert.ifError);
+      bucket.getFiles(
+        {
+          maxResults: 5,
+          pageToken: token,
+          includeFoldersAsPrefixes: true,
+          delimiter: '/',
+          autoPaginate: false,
+        },
+        util.noop
+      );
     });
 
     it('should return nextQuery if more results exist', () => {
@@ -1795,6 +1863,68 @@ describe('Bucket', () => {
         assert.ifError(err);
         assert(files[0] instanceof FakeFile);
         assert.strictEqual(files[0].calledWith_[2].generation, 1);
+        done();
+      });
+    });
+
+    it('should return Files with specified values if queried for fields', done => {
+      bucket.request = (
+        reqOpts: DecorateRequestOptions,
+        callback: Function
+      ) => {
+        callback(null, {
+          items: [{name: 'fake-file-name'}],
+        });
+      };
+
+      bucket.getFiles(
+        {fields: 'items(name)'},
+        (err: Error, files: FakeFile[]) => {
+          assert.ifError(err);
+          assert.strictEqual(files[0].name, 'fake-file-name');
+          done();
+        }
+      );
+    });
+
+    it('should add nextPageToken to fields for autoPaginate', done => {
+      bucket.request = (
+        reqOpts: DecorateRequestOptions,
+        callback: Function
+      ) => {
+        assert.strictEqual(reqOpts.qs.fields, 'items(name),nextPageToken');
+        callback(null, {
+          items: [{name: 'fake-file-name'}],
+          nextPageToken: 'fake-page-token',
+        });
+      };
+
+      bucket.getFiles(
+        {fields: 'items(name)', autoPaginate: true},
+        (err: Error, files: FakeFile[], nextQuery: {pageToken: string}) => {
+          assert.ifError(err);
+          assert.strictEqual(files[0].name, 'fake-file-name');
+          assert.strictEqual(nextQuery.pageToken, 'fake-page-token');
+          done();
+        }
+      );
+    });
+
+    it('should return soft-deleted Files if queried for softDeleted', done => {
+      const softDeletedTime = new Date('1/1/2024').toISOString();
+      bucket.request = (
+        reqOpts: DecorateRequestOptions,
+        callback: Function
+      ) => {
+        callback(null, {
+          items: [{name: 'fake-file-name', generation: 1, softDeletedTime}],
+        });
+      };
+
+      bucket.getFiles({softDeleted: true}, (err: Error, files: FakeFile[]) => {
+        assert.ifError(err);
+        assert(files[0] instanceof FakeFile);
+        assert.strictEqual(files[0].metadata.softDeletedTime, softDeletedTime);
         done();
       });
     });
@@ -2076,47 +2206,23 @@ describe('Bucket', () => {
             version: 'v4',
             expires: SIGNED_URL_CONFIG.expires,
             extensionHeaders: {},
+            host: undefined,
             queryParams: {},
             cname: CNAME,
+            signingEndpoint: undefined,
           });
           done();
         }
       );
     });
-
-    it('should error if action is null', () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      SIGNED_URL_CONFIG.action = null as any;
-
-      assert.throws(() => {
-        bucket.getSignedUrl(SIGNED_URL_CONFIG, () => {});
-      }, /The action is not provided or invalid./);
-    });
-
-    it('should error if action is undefined', () => {
-      delete SIGNED_URL_CONFIG.action;
-      assert.throws(() => {
-        bucket.getSignedUrl(SIGNED_URL_CONFIG, () => {});
-      }, /The action is not provided or invalid./);
-    });
-
-    it('should error for an invalid action', () => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      SIGNED_URL_CONFIG.action = 'watch' as any;
-
-      assert.throws(() => {
-        bucket.getSignedUrl(SIGNED_URL_CONFIG, () => {});
-      }, /The action is not provided or invalid./);
-    });
   });
 
   describe('lock', () => {
     it('should throw if a metageneration is not provided', () => {
-      const expectedError = new RegExp('A metageneration must be provided.');
-
       assert.throws(() => {
-        bucket.lock(assert.ifError);
-      }, expectedError);
+        bucket.lock(assert.ifError),
+          BucketExceptionMessages.METAGENERATION_NOT_PROVIDED;
+      });
     });
 
     it('should make the correct request', done => {
@@ -2145,13 +2251,17 @@ describe('Bucket', () => {
     it('should set predefinedAcl & privatize files', done => {
       let didSetPredefinedAcl = false;
       let didMakeFilesPrivate = false;
+      const opts = {
+        includeFiles: true,
+        force: true,
+      };
 
-      bucket.setMetadata = (metadata: {}, options: {}) => {
+      bucket.setMetadata = (metadata: {}, options: {}, callback: Function) => {
         assert.deepStrictEqual(metadata, {acl: null});
         assert.deepStrictEqual(options, {predefinedAcl: 'projectPrivate'});
 
         didSetPredefinedAcl = true;
-        return Promise.resolve();
+        bucket.makeAllFilesPublicPrivate_(opts, callback);
       };
 
       bucket.makeAllFilesPublicPrivate_ = (
@@ -2164,7 +2274,7 @@ describe('Bucket', () => {
         callback();
       };
 
-      bucket.makePrivate({includeFiles: true, force: true}, (err: Error) => {
+      bucket.makePrivate(opts, (err: Error) => {
         assert.ifError(err);
         assert(didSetPredefinedAcl);
         assert(didMakeFilesPrivate);
@@ -2194,7 +2304,7 @@ describe('Bucket', () => {
       };
       bucket.setMetadata = (metadata: {}, options_: SetFileMetadataOptions) => {
         assert.strictEqual(options_.userProject, options.userProject);
-        return Promise.resolve();
+        done();
       };
       bucket.makePrivate(options, done);
     });
@@ -2228,14 +2338,6 @@ describe('Bucket', () => {
         assert.strictEqual(err, error);
         done();
       });
-    });
-
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      bucket.setMetadata = () => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        return Promise.resolve();
-      };
-      bucket.makePrivate({}, done);
     });
   });
 
@@ -2315,8 +2417,8 @@ describe('Bucket', () => {
   describe('notification', () => {
     it('should throw an error if an id is not provided', () => {
       assert.throws(() => {
-        bucket.notification();
-      }, /You must supply a notification ID\./);
+        bucket.notification(), BucketExceptionMessages.SUPPLY_NOTIFICATION_ID;
+      });
     });
 
     it('should return a Notification object', () => {
@@ -2331,24 +2433,39 @@ describe('Bucket', () => {
 
   describe('removeRetentionPeriod', () => {
     it('should call setMetadata correctly', done => {
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
+      bucket.setMetadata = (
+        metadata: {},
+        _optionsOrCallback: {},
+        callback: Function
+      ) => {
         assert.deepStrictEqual(metadata, {
           retentionPolicy: null,
         });
 
-        callback(); // done()
+        Promise.resolve([]).then(resp => callback(null, ...resp));
       };
 
       bucket.removeRetentionPeriod(done);
     });
+  });
 
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        callback();
+  describe('restore', () => {
+    it('should pass options to underlying request call', async () => {
+      bucket.request = function (
+        reqOpts: DecorateRequestOptions,
+        callback_: Function
+      ) {
+        assert.strictEqual(this, bucket);
+        assert.deepStrictEqual(reqOpts, {
+          method: 'POST',
+          uri: '/restore',
+          qs: {generation: 123456789},
+        });
+        assert.strictEqual(callback_, undefined);
+        return [];
       };
 
-      bucket.removeRetentionPeriod(done);
+      await bucket.restore({generation: 123456789});
     });
   });
 
@@ -2428,12 +2545,12 @@ describe('Bucket', () => {
     it('should correctly call setMetadata', done => {
       const labels = {};
       bucket.setMetadata = (
-        metadata: Metadata,
-        options: {},
+        metadata: BucketMetadata,
+        _callbackOrOptions: {},
         callback: Function
       ) => {
         assert.strictEqual(metadata.labels, labels);
-        callback(); // done()
+        Promise.resolve([]).then(resp => callback(null, ...resp));
       };
       bucket.setLabels(labels, done);
     });
@@ -2447,39 +2564,24 @@ describe('Bucket', () => {
       };
       bucket.setLabels(labels, options, done);
     });
-
-    it('should disable autoRetry when isMetagenerationMatch is undefined', done => {
-      bucket.setMetadata = (metadata: {}, options: {}, callback: Function) => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        callback();
-      };
-      bucket.setLabels({}, done);
-    });
   });
 
   describe('setRetentionPeriod', () => {
     it('should call setMetadata correctly', done => {
       const duration = 90000;
 
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
+      bucket.setMetadata = (
+        metadata: {},
+        _callbackOrOptions: {},
+        callback: Function
+      ) => {
         assert.deepStrictEqual(metadata, {
           retentionPolicy: {
-            retentionPeriod: duration,
+            retentionPeriod: `${duration}`,
           },
         });
 
-        callback(); // done()
-      };
-
-      bucket.setRetentionPeriod(duration, done);
-    });
-
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      const duration = 90000;
-
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        callback();
+        Promise.resolve([]).then(resp => callback(null, ...resp));
       };
 
       bucket.setRetentionPeriod(duration, done);
@@ -2490,23 +2592,16 @@ describe('Bucket', () => {
     it('should call setMetadata correctly', done => {
       const corsConfiguration = [{maxAgeSeconds: 3600}];
 
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
+      bucket.setMetadata = (
+        metadata: {},
+        _callbackOrOptions: {},
+        callback: Function
+      ) => {
         assert.deepStrictEqual(metadata, {
           cors: corsConfiguration,
         });
 
-        callback(); // done()
-      };
-
-      bucket.setCorsConfiguration(corsConfiguration, done);
-    });
-
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      const corsConfiguration = [{maxAgeSeconds: 3600}];
-
-      bucket.setMetadata = (metadata: {}, callback: Function) => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        callback();
+        return Promise.resolve([]).then(resp => callback(null, ...resp));
       };
 
       bucket.setCorsConfiguration(corsConfiguration, done);
@@ -2519,7 +2614,7 @@ describe('Bucket', () => {
     const CALLBACK = util.noop;
 
     it('should convert camelCase to snake_case', done => {
-      bucket.setMetadata = (metadata: Metadata) => {
+      bucket.setMetadata = (metadata: BucketMetadata) => {
         assert.strictEqual(metadata.storageClass, 'CAMEL_CASE');
         done();
       };
@@ -2528,7 +2623,7 @@ describe('Bucket', () => {
     });
 
     it('should convert hyphenate to snake_case', done => {
-      bucket.setMetadata = (metadata: Metadata) => {
+      bucket.setMetadata = (metadata: BucketMetadata) => {
         assert.strictEqual(metadata.storageClass, 'HYPHENATED_CLASS');
         done();
       };
@@ -2536,32 +2631,18 @@ describe('Bucket', () => {
       bucket.setStorageClass('hyphenated-class', OPTIONS, CALLBACK);
     });
 
-    it('should call setMetdata correctly', done => {
+    it('should call setMetdata correctly', () => {
       bucket.setMetadata = (
-        metadata: Metadata,
+        metadata: BucketMetadata,
         options: {},
         callback: Function
       ) => {
         assert.deepStrictEqual(metadata, {storageClass: STORAGE_CLASS});
         assert.strictEqual(options, OPTIONS);
-        assert.strictEqual(callback, CALLBACK);
-        done();
+        Promise.resolve([]).then(resp => callback(null, ...resp));
       };
 
       bucket.setStorageClass(STORAGE_CLASS, OPTIONS, CALLBACK);
-    });
-
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      bucket.setMetadata = (
-        metadata: Metadata,
-        options: {},
-        callback: Function
-      ) => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        callback();
-      };
-
-      bucket.setStorageClass(STORAGE_CLASS, OPTIONS, done);
     });
   });
 
@@ -2600,7 +2681,15 @@ describe('Bucket', () => {
 
   describe('upload', () => {
     const basename = 'testfile.json';
-    const filepath = path.join(__dirname, '../../test/testdata/' + basename);
+    const filepath = path.join(
+      getDirName(),
+      '../../../test/testdata/' + basename
+    );
+    const nonExistentFilePath = path.join(
+      getDirName(),
+      '../../../test/testdata/',
+      'non-existent-file'
+    );
     const metadata = {
       metadata: {
         a: 'b',
@@ -2609,7 +2698,7 @@ describe('Bucket', () => {
     };
 
     beforeEach(() => {
-      bucket.file = (name: string, metadata: Metadata) => {
+      bucket.file = (name: string, metadata: FileMetadata) => {
         return new FakeFile(bucket, name, metadata);
       };
     });
@@ -2711,18 +2800,6 @@ describe('Bucket', () => {
       });
     });
 
-    it('should disable autoRetry when ifMetagenerationMatch is undefined', done => {
-      const fakeFile = new FakeFile(bucket, 'file-name');
-      fakeFile.isSameFile = () => {
-        return true;
-      };
-      const options = {destination: fakeFile, metadata};
-      bucket.upload(filepath, options, () => {
-        assert.strictEqual(bucket.storage.retryOptions.autoRetry, false);
-        done();
-      });
-    });
-
     describe('resumable uploads', () => {
       class DelayedStream500Error extends Transform {
         retryCount: number;
@@ -2748,48 +2825,14 @@ describe('Bucket', () => {
         };
       });
 
-      it('should force a resumable upload', done => {
+      it('should respect setting a resumable upload to false', done => {
         const fakeFile = new FakeFile(bucket, 'file-name');
-        const options = {destination: fakeFile, resumable: true};
+        const options = {destination: fakeFile, resumable: false};
         fakeFile.createWriteStream = (options_: CreateWriteStreamOptions) => {
           const ws = new stream.Writable();
           ws.write = () => true;
           setImmediate(() => {
             assert.strictEqual(options_.resumable, options.resumable);
-            done();
-          });
-          return ws;
-        };
-        bucket.upload(filepath, options, assert.ifError);
-      });
-
-      it('should not pass resumable option to createWriteStream when file size is greater than minimum resumable threshold', done => {
-        const fakeFile = new FakeFile(bucket, 'file-name');
-        const options = {destination: fakeFile};
-        fsStatOverride = (path: string, callback: Function) => {
-          // Set size greater than threshold
-          callback(null, {size: 5000001});
-        };
-        fakeFile.createWriteStream = (options_: CreateWriteStreamOptions) => {
-          const ws = new stream.Writable();
-          ws.write = () => true;
-          setImmediate(() => {
-            assert.strictEqual(typeof options_.resumable, 'undefined');
-            done();
-          });
-          return ws;
-        };
-        bucket.upload(filepath, options, assert.ifError);
-      });
-
-      it('should prevent resumable when file size is less than minimum resumable threshold', done => {
-        const fakeFile = new FakeFile(bucket, 'file-name');
-        const options = {destination: fakeFile};
-        fakeFile.createWriteStream = (options_: CreateWriteStreamOptions) => {
-          const ws = new stream.Writable();
-          ws.write = () => true;
-          setImmediate(() => {
-            assert.strictEqual(options_.resumable, false);
             done();
           });
           return ws;
@@ -2991,7 +3034,7 @@ describe('Bucket', () => {
         ws.write = () => true;
         setImmediate(() => {
           assert.strictEqual(
-            options.metadata.contentType,
+            options!.metadata!.contentType,
             metadata.contentType
           );
           done();
@@ -3062,6 +3105,14 @@ describe('Bucket', () => {
           done();
         }
       );
+    });
+
+    it('should capture and throw on non-existent files', done => {
+      bucket.upload(nonExistentFilePath, (err: Error) => {
+        assert(err);
+        assert(err.message.includes('ENOENT'));
+        done();
+      });
     });
   });
 

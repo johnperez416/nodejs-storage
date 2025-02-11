@@ -15,10 +15,9 @@
 import {
   BodyResponseCallback,
   DecorateRequestOptions,
-  Metadata,
-} from '@google-cloud/common';
+  BaseMetadata,
+} from './nodejs-common/index.js';
 import {promisifyAll} from '@google-cloud/promisify';
-import arrify = require('arrify');
 
 export interface AclOptions {
   pathPrefix: string;
@@ -30,13 +29,13 @@ export interface AclOptions {
 
 export type GetAclResponse = [
   AccessControlObject | AccessControlObject[],
-  Metadata
+  AclMetadata,
 ];
 export interface GetAclCallback {
   (
     err: Error | null,
     acl?: AccessControlObject | AccessControlObject[] | null,
-    apiResponse?: Metadata
+    apiResponse?: AclMetadata
   ): void;
 }
 export interface GetAclOptions {
@@ -51,12 +50,12 @@ export interface UpdateAclOptions {
   generation?: number;
   userProject?: string;
 }
-export type UpdateAclResponse = [AccessControlObject, Metadata];
+export type UpdateAclResponse = [AccessControlObject, AclMetadata];
 export interface UpdateAclCallback {
   (
     err: Error | null,
     acl?: AccessControlObject | null,
-    apiResponse?: Metadata
+    apiResponse?: AclMetadata
   ): void;
 }
 
@@ -66,17 +65,17 @@ export interface AddAclOptions {
   generation?: number;
   userProject?: string;
 }
-export type AddAclResponse = [AccessControlObject, Metadata];
+export type AddAclResponse = [AccessControlObject, AclMetadata];
 export interface AddAclCallback {
   (
     err: Error | null,
     acl?: AccessControlObject | null,
-    apiResponse?: Metadata
+    apiResponse?: AclMetadata
   ): void;
 }
-export type RemoveAclResponse = [Metadata];
+export type RemoveAclResponse = [AclMetadata];
 export interface RemoveAclCallback {
-  (err: Error | null, apiResponse?: Metadata): void;
+  (err: Error | null, apiResponse?: AclMetadata): void;
 }
 export interface RemoveAclOptions {
   entity: string;
@@ -93,6 +92,21 @@ export interface AccessControlObject {
   entity: string;
   role: string;
   projectTeam: string;
+}
+
+export interface AclMetadata extends BaseMetadata {
+  bucket?: string;
+  domain?: string;
+  entity?: string;
+  entityId?: string;
+  generation?: string;
+  object?: string;
+  projectTeam?: {
+    projectNumber?: string;
+    team?: 'editors' | 'owners' | 'viewers';
+  };
+  role?: 'OWNER' | 'READER' | 'WRITER' | 'FULL_CONTROL';
+  [key: string]: unknown;
 }
 
 /**
@@ -304,7 +318,8 @@ class AclRoleAccessorMethods {
       const isPrefix = entity.charAt(entity.length - 1) === '-';
 
       accessMethods.forEach(accessMethod => {
-        let method = accessMethod + entity[0].toUpperCase() + entity.substr(1);
+        let method =
+          accessMethod + entity[0].toUpperCase() + entity.substring(1);
 
         if (isPrefix) {
           method = method.replace('-', '');
@@ -510,6 +525,7 @@ class Acl extends AclRoleAccessorMethods {
         method: 'POST',
         uri: '',
         qs: query,
+        maxRetries: 0, //explicitly set this value since this is a non-idempotent function
         json: {
           entity: options.entity,
           role: options.role.toUpperCase(),
@@ -641,7 +657,7 @@ class Acl extends AclRoleAccessorMethods {
    * @param {object|function} [options] Configuration options. If you want to
    *     receive a list of all access controls, pass the callback function as
    * the only argument.
-   * @param {string} [options.entity] Whose permissions will be fetched.
+   * @param {string} options.entity Whose permissions will be fetched.
    * @param {number} [options.generation] **File Objects Only** Select a specific
    *     revision of this file (as opposed to the latest version, the default).
    * @param {string} [options.userProject] The ID of the project which will be
@@ -741,7 +757,7 @@ class Acl extends AclRoleAccessorMethods {
         let results;
 
         if (resp.items) {
-          results = arrify(resp.items).map(this.makeAclObject_);
+          results = resp.items.map(this.makeAclObject_);
         } else {
           results = this.makeAclObject_(resp);
         }
